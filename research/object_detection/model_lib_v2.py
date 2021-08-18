@@ -639,11 +639,45 @@ def train_loop(
                 _sample_and_train(strategy, train_step_fn, data_iterator)
 
           return _sample_and_train(strategy, train_step_fn, data_iterator)
+        
+        def _checkpoint_callback(manager):
+          """Call checkpoint callback function."""
+          # Prepare the data  
+          class CheckpointData(object):
+            def __init__(self, *args, **kwargs):
+              self.checkpoint = manager.checkpoint
+              self.checkpoints = manager.checkpoints
+              self.latest_checkpoint = manager.latest_checkpoint
+              self.cancel = False
+              return super().__init__(*args, **kwargs)
+          checkpoint_data = CheckpointData()
+          if ('checkpoint_callback' in kwargs):
+            kwargs['checkpoint_callback'](checkpoint_data)
+          return checkpoint_data
+        
+        def _step_callback(steps, time, loss):
+          """Call step callback function."""
+          # Prepare the data  
+          class StepData(object):
+            def __init__(self, *args, **kwargs):
+              self.global_step = int(steps)
+              self.per_step_time = time
+              self.loss = float(loss)
+              self.create_checkpoint = False
+              self.cancel = False
+              return super().__init__(*args, **kwargs)
+          step_data = StepData()
+          # Call the callback if defined
+          if ('step_callback' in kwargs):
+            kwargs['step_callback'](step_data)
+          return step_data
 
         train_input_iter = iter(train_input)
 
         if int(global_step.value()) == 0:
           manager.save()
+          if (_checkpoint_callback(manager).cancel):
+            return
 
         checkpointed_step = int(global_step.value())
         logged_step = global_step.value()
@@ -663,6 +697,12 @@ def train_loop(
 
           steps_per_sec_list.append(steps_per_sec)
 
+          step_data = _step_callback(
+              global_step.value(),
+              time_taken / num_steps_per_iteration, loss)
+          if (step_data.cancel):
+            return
+
           if global_step.value() - logged_step >= 100:
             tf.logging.info(
                 'Step {} per-step time {:.3f}s loss={:.3f}'.format(
@@ -670,10 +710,13 @@ def train_loop(
                     loss))
             logged_step = global_step.value()
 
-          if ((int(global_step.value()) - checkpointed_step) >=
+          if (step_data.create_checkpoint or
+              (int(global_step.value()) - checkpointed_step) >=
               checkpoint_every_n):
             manager.save()
             checkpointed_step = int(global_step.value())
+            if (_checkpoint_callback(manager).cancel):
+              return
 
   # Remove the checkpoint directories of the non-chief workers that
   # MultiWorkerMirroredStrategy forces us to save during sync distributed
@@ -1101,8 +1144,34 @@ def eval_continuously(
   optimizer, _ = optimizer_builder.build(
       configs['train_config'].optimizer, global_step=global_step)
 
+  def _eval_callback(metrics):
+    """Call evaluation ready callback function."""
+    if (not 'eval_callback' in kwargs):
+      return True
+    class EvalData(object):
+      def __init__(self, *args, **kwargs):
+        self.metrics = metrics
+        self.cancel = False
+        return super().__init__(*args, **kwargs)
+    eval_data = EvalData()
+    kwargs['eval_callback'](eval_data)
+    return not eval_data.cancel
+
+  def _timeout_fn():
+    """Call evaluation timeout callback function."""
+    if (not 'eval_timeout_callback' in kwargs):
+      return False
+    class EvalTimeoutData(object):
+      def __init__(self, *args, **kwargs):
+        self.cancel = False
+        return super().__init__(*args, **kwargs)
+    eval_timeout_data = EvalTimeoutData()
+    kwargs['eval_timeout_callback'](eval_timeout_data)
+    return eval_timeout_data.cancel
+
   for latest_checkpoint in tf.train.checkpoints_iterator(
-      checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval):
+      checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval,
+      timeout_fn=_timeout_fn):
     ckpt = tf.compat.v2.train.Checkpoint(
         step=global_step, model=detection_model, optimizer=optimizer)
 
@@ -1117,7 +1186,7 @@ def eval_continuously(
     summary_writer = tf.compat.v2.summary.create_file_writer(
         os.path.join(model_dir, 'eval', eval_input_config.name))
     with summary_writer.as_default():
-      eager_eval_loop(
+      metrics = eager_eval_loop(
           detection_model,
           configs,
           eval_input,
@@ -1125,3 +1194,5 @@ def eval_continuously(
           postprocess_on_cpu=postprocess_on_cpu,
           global_step=global_step,
           )
+      if (not _eval_callback(metrics)):
+        return

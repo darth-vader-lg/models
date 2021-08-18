@@ -50,7 +50,9 @@ flags.DEFINE_string(
     '`checkpoint_dir` is provided, this binary operates in eval-only mode, '
     'writing resulting metrics to `model_dir`.')
 
-flags.DEFINE_integer('eval_timeout', 3600, 'Number of seconds to wait for an'
+flags.DEFINE_integer('wait_interval', 300, 'Number of seconds between checks '
+                     'for new checkpoint.')
+flags.DEFINE_integer('eval_timeout', 3600, 'Number of seconds to wait for an '
                      'evaluation checkpoint before exiting.')
 
 flags.DEFINE_bool('use_tpu', False, 'Whether the job is executing on a TPU.')
@@ -71,7 +73,7 @@ flags.DEFINE_boolean('record_summaries', True,
 FLAGS = flags.FLAGS
 
 
-def main(unused_argv):
+def main(unused_argv, **kwargs):
   flags.mark_flag_as_required('model_dir')
   flags.mark_flag_as_required('pipeline_config_path')
   tf.config.set_soft_device_placement(True)
@@ -85,7 +87,8 @@ def main(unused_argv):
         sample_1_of_n_eval_on_train_examples=(
             FLAGS.sample_1_of_n_eval_on_train_examples),
         checkpoint_dir=FLAGS.checkpoint_dir,
-        wait_interval=300, timeout=FLAGS.eval_timeout)
+        wait_interval=FLAGS.wait_interval, timeout=FLAGS.eval_timeout,
+        **kwargs)
   else:
     if FLAGS.use_tpu:
       # TPU is automatically inferred if tpu_name is None and
@@ -107,7 +110,8 @@ def main(unused_argv):
           train_steps=FLAGS.num_train_steps,
           use_tpu=FLAGS.use_tpu,
           checkpoint_every_n=FLAGS.checkpoint_every_n,
-          record_summaries=FLAGS.record_summaries)
+          record_summaries=FLAGS.record_summaries,
+          **kwargs)
 
 if __name__ == '__main__':
   tf.compat.v1.app.run()
