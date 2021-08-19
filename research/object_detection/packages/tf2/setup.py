@@ -21,12 +21,12 @@ REQUIRED_PACKAGES = [
     'lvis',
     'scipy',
     'pandas',
-    'tf-models-official'
+    'tf-models-official==2.4.0'
 ]
 
 setup(
     name='object_detection',
-    version='2.4.0',
+    version='2.4.3',
     install_requires=REQUIRED_PACKAGES,
     include_package_data=True,
     packages=(
