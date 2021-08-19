@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Video classification task definition."""
-import tensorflow as tf
 from absl import logging
-from official.core import base_task, input_reader, task_factory
+import tensorflow as tf
+
+from official.core import base_task
+from official.core import input_reader
+from official.core import task_factory
 from official.modeling import tf_utils
 from official.vision.beta.projects.yt8m.configs import yt8m as yt8m_cfg
 from official.vision.beta.projects.yt8m.dataloaders import yt8m_input
 from official.vision.beta.projects.yt8m.eval_utils import eval_util
-from official.vision.beta.projects.yt8m.modeling import \
-    yt8m_model_utils as utils
+from official.vision.beta.projects.yt8m.modeling import yt8m_model_utils as utils
 from official.vision.beta.projects.yt8m.modeling.yt8m_model import YT8MModel
 
 
@@ -38,22 +40,22 @@ class YT8MTask(base_task.Task):
     input_specs = tf.keras.layers.InputSpec(shape=[None] + common_input_shape)
     logging.info('Build model input %r', common_input_shape)
 
-    #model configuration
+    # Model configuration.
     model_config = self.task_config.model
     model = YT8MModel(
-              input_params=model_config,
-              input_specs=input_specs,
-              num_frames=train_cfg.num_frames,
-              num_classes=train_cfg.num_classes
-              )
+        input_params=model_config,
+        input_specs=input_specs,
+        num_frames=train_cfg.num_frames,
+        num_classes=train_cfg.num_classes)
     return model
 
   def build_inputs(self, params: yt8m_cfg.DataConfig, input_context=None):
     """Builds input.
+
     Args:
       params: configuration for input data
-      input_context: indicates information about
-       the compute replicas and input pipelines
+      input_context: indicates information about the compute replicas and input
+        pipelines
 
     Returns:
       dataset: dataset fetched from reader
@@ -74,30 +76,30 @@ class YT8MTask(base_task.Task):
         decoder_fn=decoder_fn,
         parser_fn=parser_fn,
         postprocess_fn=postprocess_fn,
-        transform_and_batch_fn=batch_fn
-    )
+        transform_and_batch_fn=batch_fn)
 
     dataset = reader.read(input_context=input_context)
 
     return dataset
 
   def build_losses(self, labels, model_outputs, aux_losses=None):
-    """Sigmoid Cross Entropy
+    """Sigmoid Cross Entropy.
+
     Args:
       labels: tensor containing truth labels.
       model_outputs: output logits of the classifier.
-      aux_losses: tensor containing auxiliarly loss tensors,
-        i.e. `losses` in keras.Model.
+      aux_losses: tensor containing auxiliarly loss tensors, i.e. `losses` in
+        keras.Model.
 
     Returns:
       Tensors: The total loss, model loss tensors.
     """
     losses_config = self.task_config.losses
     model_loss = tf.keras.losses.binary_crossentropy(
-      labels,
-      model_outputs,
-      from_logits=losses_config.from_logits,
-      label_smoothing=losses_config.label_smoothing)
+        labels,
+        model_outputs,
+        from_logits=losses_config.from_logits,
+        label_smoothing=losses_config.label_smoothing)
 
     model_loss = tf_utils.safe_mean(model_loss)
     total_loss = model_loss
@@ -106,17 +108,16 @@ class YT8MTask(base_task.Task):
 
     return total_loss, model_loss
 
-
   def build_metrics(self, training=True):
     """Gets streaming metrics for training/validation.
+
        metric: mAP/gAP
        top_k: A positive integer specifying how many predictions are considered
         per video.
        top_n: A positive Integer specifying the average precision at n, or None
         to use all provided data points.
     Args:
-      training: bool value, true for training mode,
-          false for eval/validation.
+      training: bool value, true for training mode, false for eval/validation.
 
     Returns:
       list of strings that indicate metrics to be used
@@ -126,27 +127,24 @@ class YT8MTask(base_task.Task):
     for name in metric_names:
       metrics.append(tf.keras.metrics.Mean(name, dtype=tf.float32))
 
-    if not training: #cannot run in train step
+    if not training:  # Cannot run in train step.
       num_classes = self.task_config.validation_data.num_classes
       top_k = self.task_config.top_k
       top_n = self.task_config.top_n
       self.avg_prec_metric = eval_util.EvaluationMetrics(
-        num_classes, top_k=top_k, top_n=top_n)
+          num_classes, top_k=top_k, top_n=top_n)
 
     return metrics
 
-
   def train_step(self, inputs, model, optimizer, metrics=None):
     """Does forward and backward.
+
     Args:
-      inputs:
-          a dictionary of input tensors.
-            output_dict = {
+      inputs: a dictionary of input tensors. output_dict = {
           "video_ids": batch_video_ids,
           "video_matrix": batch_video_matrix,
           "labels": batch_labels,
-          "num_frames": batch_frames,
-          }
+          "num_frames": batch_frames, }
       model: the model, forward pass definition.
       optimizer: the optimizer for this training step.
       metrics: a nested structure of metrics objects.
@@ -169,7 +167,6 @@ class YT8MTask(base_task.Task):
     else:
       features = utils.SampleRandomSequence(features, num_frames, sample_frames)
 
-
     num_replicas = tf.distribute.get_strategy().num_replicas_in_sync
     with tf.GradientTape() as tape:
       outputs = model(features, training=True)
@@ -177,44 +174,36 @@ class YT8MTask(base_task.Task):
       # mixed_float16 or mixed_bfloat16 to ensure output is casted as float32.
       outputs = tf.nest.map_structure(lambda x: tf.cast(x, tf.float32), outputs)
 
-
       # Computes per-replica loss
       loss, model_loss = self.build_losses(
-        model_outputs=outputs, labels=labels, aux_losses=model.losses)
+          model_outputs=outputs, labels=labels, aux_losses=model.losses)
       # Scales loss as the default gradients allreduce performs sum inside the
       # optimizer.
       scaled_loss = loss / num_replicas
 
-
       # For mixed_precision policy, when LossScaleOptimizer is used, loss is
       # scaled for numerical stability.
-      if isinstance(
-              optimizer,
-              tf.keras.mixed_precision.experimental.LossScaleOptimizer):
+      if isinstance(optimizer,
+                    tf.keras.mixed_precision.LossScaleOptimizer):
         scaled_loss = optimizer.get_scaled_loss(scaled_loss)
-
 
     tvars = model.trainable_variables
     grads = tape.gradient(scaled_loss, tvars)
     # Scales back gradient before apply_gradients when LossScaleOptimizer is
     # used.
-    if isinstance(
-            optimizer,
-            tf.keras.mixed_precision.experimental.LossScaleOptimizer):
+    if isinstance(optimizer,
+                  tf.keras.mixed_precision.LossScaleOptimizer):
       grads = optimizer.get_unscaled_gradients(grads)
 
     # Apply gradient clipping.
     if self.task_config.gradient_clip_norm > 0:
-      grads, _ = tf.clip_by_global_norm(
-        grads, self.task_config.gradient_clip_norm)
+      grads, _ = tf.clip_by_global_norm(grads,
+                                        self.task_config.gradient_clip_norm)
     optimizer.apply_gradients(list(zip(grads, tvars)))
 
     logs = {self.loss: loss}
 
-    all_losses = {
-      'total_loss': loss,
-      'model_loss': model_loss
-    }
+    all_losses = {'total_loss': loss, 'model_loss': model_loss}
 
     if metrics:
       for m in metrics:
@@ -227,14 +216,11 @@ class YT8MTask(base_task.Task):
     """Validatation step.
 
     Args:
-      inputs:
-        a dictionary of input tensors.
-          output_dict = {
+      inputs: a dictionary of input tensors. output_dict = {
         "video_ids": batch_video_ids,
         "video_matrix": batch_video_matrix,
         "labels": batch_labels,
-        "num_frames": batch_frames,
-        }
+        "num_frames": batch_frames, }
       model: the model, forward definition
       metrics: a nested structure of metrics objects.
 
@@ -263,15 +249,12 @@ class YT8MTask(base_task.Task):
       # remove padding
       outputs = outputs[~tf.reduce_all(labels == -1, axis=1)]
       labels = labels[~tf.reduce_all(labels == -1, axis=1)]
-    loss, model_loss = self.build_losses(model_outputs=outputs, labels=labels,
-                             aux_losses=model.losses)
+    loss, model_loss = self.build_losses(
+        model_outputs=outputs, labels=labels, aux_losses=model.losses)
 
     logs = {self.loss: loss}
 
-    all_losses = {
-      'total_loss' : loss,
-      'model_loss' : model_loss
-    }
+    all_losses = {'total_loss': loss, 'model_loss': model_loss}
 
     logs.update({self.avg_prec_metric.name: (labels, outputs)})
 
@@ -289,9 +272,8 @@ class YT8MTask(base_task.Task):
     if state is None:
       state = self.avg_prec_metric
     self.avg_prec_metric.accumulate(
-      labels=step_logs[self.avg_prec_metric.name][0],
-      predictions=step_logs[self.avg_prec_metric.name][1]
-    )
+        labels=step_logs[self.avg_prec_metric.name][0],
+        predictions=step_logs[self.avg_prec_metric.name][1])
     return state
 
   def reduce_aggregated_logs(self, aggregated_logs):

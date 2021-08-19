@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Provides functions to help with evaluating models."""
 import numpy as np
 import tensorflow as tf
@@ -22,8 +22,10 @@ from official.vision.beta.projects.yt8m.eval_utils import \
 
 
 def flatten(l):
-  """Merges a list of lists into a single list. """
+  """Merges a list of lists into a single list."""
+  # pylint: disable=g-complex-comprehension
   return [item for sublist in l for item in sublist]
+  # pylint: enable=g-complex-comprehension
 
 
 def calculate_hit_at_one(predictions, actuals):
@@ -59,9 +61,7 @@ def calculate_precision_at_equal_recall_rate(predictions, actuals):
   num_videos = actuals.shape[0]
   for row in np.arange(num_videos):
     num_labels = int(np.sum(actuals[row]))
-    top_indices = np.argpartition(
-      predictions[row], -num_labels
-    )[-num_labels:]
+    top_indices = np.argpartition(predictions[row], -num_labels)[-num_labels:]
     item_precision = 0.0
     for label_index in top_indices:
       if predictions[row][label_index] > 0:
@@ -90,8 +90,8 @@ def calculate_gap(predictions, actuals, top_k=20):
   gap_calculator = ap_calculator.AveragePrecisionCalculator()
   sparse_predictions, sparse_labels, num_positives = top_k_by_class(
       predictions, actuals, top_k)
-  gap_calculator.accumulate(flatten(sparse_predictions), flatten(sparse_labels),
-                            sum(num_positives))
+  gap_calculator.accumulate(
+      flatten(sparse_predictions), flatten(sparse_labels), sum(num_positives))
   return gap_calculator.peek_ap_at_n()
 
 
@@ -101,6 +101,8 @@ def top_k_by_class(predictions, labels, k=20):
   Args:
     predictions: A numpy matrix containing the outputs of the model. Dimensions
       are 'batch' x 'num_classes'.
+    labels: A numpy matrix containing the ground truth labels.
+        Dimensions are 'batch' x 'num_classes'.
     k: the top k non-zero entries to preserve in each prediction.
 
   Returns:
@@ -136,8 +138,14 @@ def top_k_by_class(predictions, labels, k=20):
 def top_k_triplets(predictions, labels, k=20):
   """Get the top_k for a 1-d numpy array.
 
-  Returns a sparse list of tuples in
-  (prediction, class) format
+  Args:
+    predictions: A numpy matrix containing the outputs of the model. Dimensions
+      are 'batch' x 'num_classes'.
+    labels: A numpy matrix containing the ground truth labels.
+        Dimensions are 'batch' x 'num_classes'.
+    k: The number top predictions to pick.
+  Returns:
+    a sparse list of tuples in (prediction, class) format.
   """
   m = len(predictions)
   k = min(k, m)
@@ -171,9 +179,7 @@ class EvaluationMetrics(object):
     self.num_examples = 0
     self.num_class = num_class
 
-
   def accumulate(self, predictions, labels):
-
     """Accumulate the metrics calculated locally for this mini-batch.
 
     Args:
@@ -190,8 +196,7 @@ class EvaluationMetrics(object):
         does not match.
     """
     predictions, labels = self._convert_to_numpy(
-      predictions=predictions[0],
-      groundtruths=labels[0])
+        predictions=predictions[0], groundtruths=labels[0])
     batch_size = labels.shape[0]
     mean_hit_at_one = calculate_hit_at_one(predictions, labels)
     mean_perr = calculate_precision_at_equal_recall_rate(predictions, labels)
@@ -201,9 +206,8 @@ class EvaluationMetrics(object):
         predictions, labels, self.top_k)
     self.map_calculator.accumulate(sparse_predictions, sparse_labels,
                                    num_positives)
-    self.global_ap_calculator.accumulate(flatten(sparse_predictions),
-                                         flatten(sparse_labels),
-                                         sum(num_positives))
+    self.global_ap_calculator.accumulate(
+        flatten(sparse_predictions), flatten(sparse_labels), sum(num_positives))
 
     self.num_examples += batch_size
     self.sum_hit_at_one += mean_hit_at_one * batch_size
@@ -249,7 +253,7 @@ class EvaluationMetrics(object):
 
   @property
   def name(self):
-    return 'avg_prec_metric'
+    return "avg_prec_metric"
 
   def _convert_to_numpy(self, groundtruths, predictions):
     """Converts tesnors to numpy arrays."""

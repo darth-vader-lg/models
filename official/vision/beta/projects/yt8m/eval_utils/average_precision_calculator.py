@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Calculate or keep track of the interpolated average precision.
 
 It provides an interface for calculating interpolated average precision for an
@@ -104,6 +104,7 @@ class AveragePrecisionCalculator(object):
         the 'predictions' and 'actuals' inputs aren't complete, then it's
         possible some true positives were missed in them. In that case, you can
         provide 'num_positives' in order to accurately track recall.
+      num_positives: number of positive examples.
 
     Raises:
       ValueError: An error occurred when the format of the input is not the
@@ -150,10 +151,11 @@ class AveragePrecisionCalculator(object):
       return 0
     predlists = numpy.array(list(zip(*self._heap)))
 
-    ap = self.ap_at_n(predlists[0],
-                      predlists[1],
-                      n=self._top_n,
-                      total_num_positives=self._total_positives)
+    ap = self.ap_at_n(
+        predlists[0],
+        predlists[1],
+        n=self._top_n,
+        total_num_positives=self._total_positives)
     return ap
 
   @staticmethod
@@ -215,9 +217,8 @@ class AveragePrecisionCalculator(object):
     # add a shuffler to avoid overestimating the ap
     predictions, actuals = AveragePrecisionCalculator._shuffle(
         predictions, actuals)
-    sortidx = sorted(range(len(predictions)),
-                     key=lambda k: predictions[k],
-                     reverse=True)
+    sortidx = sorted(
+        range(len(predictions)), key=lambda k: predictions[k], reverse=True)
 
     if total_num_positives is None:
       numpos = numpy.size(numpy.where(actuals > 0))

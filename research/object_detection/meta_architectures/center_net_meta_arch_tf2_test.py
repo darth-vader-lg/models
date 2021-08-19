@@ -17,7 +17,6 @@
 from __future__ import division
 
 import functools
-import re
 import unittest
 
 from absl.testing import parameterized
@@ -55,7 +54,7 @@ class CenterNetMetaArchPredictionHeadTest(
 class CenterNetMetaArchHelpersTest(test_case.TestCase, parameterized.TestCase):
   """Test for CenterNet meta architecture related functions."""
 
-  def test_row_col_indices_from_flattened_indices(self):
+  def test_row_col_channel_indices_from_flattened_indices(self):
     """Tests that the computation of row, col, channel indices is correct."""
 
     r_grid, c_grid, ch_grid = (np.zeros((5, 4, 3), dtype=np.int),
@@ -88,6 +87,21 @@ class CenterNetMetaArchHelpersTest(test_case.TestCase, parameterized.TestCase):
     np.testing.assert_array_equal(ri, r_grid.flatten())
     np.testing.assert_array_equal(ci, c_grid.flatten())
     np.testing.assert_array_equal(chi, ch_grid.flatten())
+
+  def test_row_col_indices_from_flattened_indices(self):
+    """Tests that the computation of row, col indices is correct."""
+
+    r_grid = np.array([[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3],
+                       [4, 4, 4, 4]])
+
+    c_grid = np.array([[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3],
+                       [0, 1, 2, 3]])
+
+    indices = np.arange(20)
+    ri, ci, = cnma.row_col_indices_from_flattened_indices(indices, 4)
+
+    np.testing.assert_array_equal(ri, r_grid.flatten())
+    np.testing.assert_array_equal(ci, c_grid.flatten())
 
   def test_flattened_indices_from_row_col_indices(self):
 
@@ -600,7 +614,7 @@ class CenterNetMetaArchHelpersTest(test_case.TestCase, parameterized.TestCase):
     boxes = self.execute(graph_fn, [])
 
     np.testing.assert_allclose(
-        [[-9, -8, 31, 52], [25, 35, 75, 85]], boxes[0])
+        [[0, 0, 31, 52], [25, 35, 75, 85]], boxes[0])
     np.testing.assert_allclose(
         [[96, 98, 106, 108], [96, 98, 106, 108]], boxes[1])
     np.testing.assert_allclose(
@@ -750,18 +764,19 @@ class CenterNetMetaArchHelpersTest(test_case.TestCase, parameterized.TestCase):
     keypoint_heatmap_np[0, 7, 7, 3] = 0.9
     keypoint_heatmap_np[0, 4, 4, 3] = 1.0
 
-    keypoint_offset_np = np.zeros((1, image_size[0], image_size[1], 2),
+    keypoint_offset_np = np.zeros((1, image_size[0], image_size[1], 8),
                                   dtype=np.float32)
-    keypoint_offset_np[0, 1, 1] = [0.5, 0.5]
-    keypoint_offset_np[0, 1, 7] = [0.5, -0.5]
-    keypoint_offset_np[0, 7, 1] = [-0.5, 0.5]
-    keypoint_offset_np[0, 7, 7] = [-0.5, -0.5]
+    keypoint_offset_np[0, 1, 1] = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    keypoint_offset_np[0, 1, 7] = [0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0]
+    keypoint_offset_np[0, 7, 1] = [0.0, 0.0, 0.0, 0.0, -0.5, 0.5, 0.0, 0.0]
+    keypoint_offset_np[0, 7, 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, -0.5]
 
     keypoint_regression_np = np.zeros((1, image_size[0], image_size[1], 8),
                                       dtype=np.float32)
     keypoint_regression_np[0, 4, 4] = [-3, -3, -3, 3, 3, -3, 3, 3]
 
-    kp_params = get_fake_kp_params(num_candidates_per_keypoint=1)
+    kp_params = get_fake_kp_params(
+        candidate_ranking_mode='score_distance_ratio')
 
     def graph_fn():
       object_heatmap = tf.constant(object_heatmap_np, dtype=tf.float32)
@@ -776,9 +791,6 @@ class CenterNetMetaArchHelpersTest(test_case.TestCase, parameterized.TestCase):
               keypoint_heatmap,
               keypoint_offset,
               keypoint_regression,
-              stride=4,
-              object_center_std_dev=image_size[0] / 2,
-              keypoint_std_dev=[image_size[0] / 10],
               kp_params=kp_params))
 
       return keypoint_cands, keypoint_scores
@@ -1484,7 +1496,9 @@ def get_fake_center_params(max_box_predictions=5):
       object_center_loss_weight=1.0,
       min_box_overlap_iou=1.0,
       max_box_predictions=max_box_predictions,
-      use_labeled_classes=False)
+      use_labeled_classes=False,
+      center_head_num_filters=[128],
+      center_head_kernel_sizes=[5])
 
 
 def get_fake_od_params():
@@ -1499,7 +1513,8 @@ def get_fake_kp_params(num_candidates_per_keypoint=100,
                        per_keypoint_offset=False,
                        predict_depth=False,
                        per_keypoint_depth=False,
-                       peak_radius=0):
+                       peak_radius=0,
+                       candidate_ranking_mode='min_distance'):
   """Returns the fake keypoint estimation parameter namedtuple."""
   return cnma.KeypointEstimationParams(
       task_name=_TASK_NAME,
@@ -1514,7 +1529,8 @@ def get_fake_kp_params(num_candidates_per_keypoint=100,
       per_keypoint_offset=per_keypoint_offset,
       predict_depth=predict_depth,
       per_keypoint_depth=per_keypoint_depth,
-      offset_peak_radius=peak_radius)
+      offset_peak_radius=peak_radius,
+      candidate_ranking_mode=candidate_ranking_mode)
 
 
 def get_fake_mask_params():
@@ -1523,7 +1539,9 @@ def get_fake_mask_params():
       classification_loss=losses.WeightedSoftmaxClassificationLoss(),
       task_loss_weight=1.0,
       mask_height=4,
-      mask_width=4)
+      mask_width=4,
+      mask_head_num_filters=[96],
+      mask_head_kernel_sizes=[3])
 
 
 def get_fake_densepose_params():
@@ -1566,7 +1584,8 @@ def build_center_net_meta_arch(build_resnet=False,
                                predict_depth=False,
                                per_keypoint_depth=False,
                                peak_radius=0,
-                               keypoint_only=False):
+                               keypoint_only=False,
+                               candidate_ranking_mode='min_distance'):
   """Builds the CenterNet meta architecture."""
   if build_resnet:
     feature_extractor = (
@@ -1612,7 +1631,8 @@ def build_center_net_meta_arch(build_resnet=False,
             _TASK_NAME:
                 get_fake_kp_params(num_candidates_per_keypoint,
                                    per_keypoint_offset, predict_depth,
-                                   per_keypoint_depth, peak_radius)
+                                   per_keypoint_depth, peak_radius,
+                                   candidate_ranking_mode)
         },
         non_max_suppression_fn=non_max_suppression_fn)
   elif detection_only:
@@ -1639,7 +1659,8 @@ def build_center_net_meta_arch(build_resnet=False,
             _TASK_NAME:
                 get_fake_kp_params(num_candidates_per_keypoint,
                                    per_keypoint_offset, predict_depth,
-                                   per_keypoint_depth, peak_radius)
+                                   per_keypoint_depth, peak_radius,
+                                   candidate_ranking_mode)
         },
         non_max_suppression_fn=non_max_suppression_fn)
   else:
@@ -1651,7 +1672,8 @@ def build_center_net_meta_arch(build_resnet=False,
         image_resizer_fn=image_resizer_fn,
         object_center_params=get_fake_center_params(),
         object_detection_params=get_fake_od_params(),
-        keypoint_params_dict={_TASK_NAME: get_fake_kp_params()},
+        keypoint_params_dict={_TASK_NAME: get_fake_kp_params(
+            candidate_ranking_mode=candidate_ranking_mode)},
         mask_params=get_fake_mask_params(),
         densepose_params=get_fake_densepose_params(),
         track_params=get_fake_track_params(),
@@ -2236,12 +2258,14 @@ class CenterNetMetaArchTest(test_case.TestCase, parameterized.TestCase):
 
   def test_postprocess_single_instance(self):
     """Test the postprocess single instance function."""
-    model = build_center_net_meta_arch(num_classes=1)
+    model = build_center_net_meta_arch(
+        num_classes=1, candidate_ranking_mode='score_distance_ratio')
     num_keypoints = len(model._kp_params_dict[_TASK_NAME].keypoint_indices)
 
     class_center = np.zeros((1, 32, 32, 1), dtype=np.float32)
     keypoint_heatmaps = np.zeros((1, 32, 32, num_keypoints), dtype=np.float32)
-    keypoint_offsets = np.zeros((1, 32, 32, 2), dtype=np.float32)
+    keypoint_offsets = np.zeros(
+        (1, 32, 32, num_keypoints * 2), dtype=np.float32)
     keypoint_regression = np.random.randn(1, 32, 32, num_keypoints * 2)
 
     class_probs = np.zeros(1)
@@ -2275,9 +2299,7 @@ class CenterNetMetaArchTest(test_case.TestCase, parameterized.TestCase):
     def graph_fn():
       detections = model.postprocess_single_instance_keypoints(
           prediction_dict,
-          tf.constant([[128, 128, 3]]),
-          object_center_std_dev=32,
-          keypoint_std_dev=[32])
+          tf.constant([[128, 128, 3]]))
       return detections
 
     detections = self.execute_cpu(graph_fn, [])
@@ -2866,15 +2888,14 @@ class CenterNetMetaArchRestoreTest(test_case.TestCase):
     self.assertIsInstance(restore_from_objects_map['feature_extractor'],
                           tf.keras.Model)
 
-  def test_retore_map_error(self):
-    """Test that restoring unsupported checkpoint type raises an error."""
+  def test_retore_map_detection(self):
+    """Test that detection checkpoints can be restored."""
 
     model = build_center_net_meta_arch(build_resnet=True)
-    msg = ("Checkpoint type \"detection\" not supported for "
-           "CenterNetResnetFeatureExtractor. Supported types are "
-           "['classification', 'fine_tune']")
-    with self.assertRaisesRegex(ValueError, re.escape(msg)):
-      model.restore_from_objects('detection')
+    restore_from_objects_map = model.restore_from_objects('detection')
+
+    self.assertIsInstance(restore_from_objects_map['model']._feature_extractor,
+                          tf.keras.Model)
 
 
 class DummyFeatureExtractor(cnma.CenterNetFeatureExtractor):
@@ -2972,6 +2993,162 @@ class CenterNetFeatureExtractorTest(test_case.TestCase):
     self.assertAllClose(output[..., 0], 1 * np.ones((2, 32, 32)))
     self.assertAllClose(output[..., 1], 2 * np.ones((2, 32, 32)))
     self.assertAllClose(output[..., 2], 3 * np.ones((2, 32, 32)))
+
+
+class Dummy1dFeatureExtractor(cnma.CenterNetFeatureExtractor):
+  """Returns a static tensor."""
+
+  def __init__(self, tensor, out_stride=1, channel_means=(0., 0., 0.),
+               channel_stds=(1., 1., 1.), bgr_ordering=False):
+    """Intializes the feature extractor.
+
+    Args:
+      tensor: The tensor to return as the processed feature.
+      out_stride: The out_stride to return if asked.
+      channel_means: Ignored, but provided for API compatability.
+      channel_stds: Ignored, but provided for API compatability.
+      bgr_ordering: Ignored, but provided for API compatability.
+    """
+
+    super().__init__(
+        channel_means=channel_means, channel_stds=channel_stds,
+        bgr_ordering=bgr_ordering)
+    self._tensor = tensor
+    self._out_stride = out_stride
+
+  def call(self, inputs):
+    return [self._tensor]
+
+  @property
+  def out_stride(self):
+    """The stride in the output image of the network."""
+    return self._out_stride
+
+  @property
+  def num_feature_outputs(self):
+    """Ther number of feature outputs returned by the feature extractor."""
+    return 1
+
+  @property
+  def supported_sub_model_types(self):
+    return ['detection']
+
+  def get_sub_model(self, sub_model_type):
+    if sub_model_type == 'detection':
+      return self._network
+    else:
+      ValueError('Sub model type "{}" not supported.'.format(sub_model_type))
+
+
+@unittest.skipIf(tf_version.is_tf1(), 'Skipping TF2.X only test.')
+class CenterNetMetaArch1dTest(test_case.TestCase, parameterized.TestCase):
+
+  @parameterized.parameters([1, 2])
+  def test_outputs_with_correct_shape(self, stride):
+    # The 1D case reuses code from the 2D cases. These tests only check that
+    # the output shapes are correct, and relies on other tests for correctness.
+    batch_size = 2
+    height = 1
+    width = 32
+    channels = 16
+    unstrided_inputs = np.random.randn(
+        batch_size, height, width, channels)
+    fixed_output_features = np.random.randn(
+        batch_size, height, width // stride, channels)
+    max_boxes = 10
+    num_classes = 3
+    feature_extractor = Dummy1dFeatureExtractor(fixed_output_features, stride)
+    arch = cnma.CenterNetMetaArch(
+        is_training=True,
+        add_summaries=True,
+        num_classes=num_classes,
+        feature_extractor=feature_extractor,
+        image_resizer_fn=None,
+        object_center_params=cnma.ObjectCenterParams(
+            classification_loss=losses.PenaltyReducedLogisticFocalLoss(),
+            object_center_loss_weight=1.0,
+            max_box_predictions=max_boxes,
+        ),
+        object_detection_params=cnma.ObjectDetectionParams(
+            localization_loss=losses.L1LocalizationLoss(),
+            scale_loss_weight=1.0,
+            offset_loss_weight=1.0,
+        ),
+        keypoint_params_dict=None,
+        mask_params=None,
+        densepose_params=None,
+        track_params=None,
+        temporal_offset_params=None,
+        use_depthwise=False,
+        compute_heatmap_sparse=False,
+        non_max_suppression_fn=None,
+        unit_height_conv=True)
+    arch.provide_groundtruth(
+        groundtruth_boxes_list=[
+            tf.constant([[0, 0.5, 1.0, 0.75],
+                         [0, 0.1, 1.0, 0.25]], tf.float32),
+            tf.constant([[0, 0, 1.0, 1.0],
+                         [0, 0, 0.0, 0.0]], tf.float32)
+            ],
+        groundtruth_classes_list=[
+            tf.constant([[0, 0, 1],
+                         [0, 1, 0]], tf.float32),
+            tf.constant([[1, 0, 0],
+                         [0, 0, 0]], tf.float32)
+            ],
+        groundtruth_weights_list=[
+            tf.constant([1.0, 1.0]),
+            tf.constant([1.0, 0.0])]
+        )
+
+    predictions = arch.predict(None, None)  # input is hardcoded above.
+    predictions['preprocessed_inputs'] = tf.constant(unstrided_inputs)
+    true_shapes = tf.constant([[1, 32, 16], [1, 24, 16]], tf.int32)
+    postprocess_output = arch.postprocess(predictions, true_shapes)
+    losses_output = arch.loss(predictions, true_shapes)
+
+    self.assertIn('%s/%s' % (cnma.LOSS_KEY_PREFIX, cnma.OBJECT_CENTER),
+                  losses_output)
+    self.assertEqual((), losses_output['%s/%s' % (
+        cnma.LOSS_KEY_PREFIX, cnma.OBJECT_CENTER)].shape)
+    self.assertIn('%s/%s' % (cnma.LOSS_KEY_PREFIX, cnma.BOX_SCALE),
+                  losses_output)
+    self.assertEqual((), losses_output['%s/%s' % (
+        cnma.LOSS_KEY_PREFIX, cnma.BOX_SCALE)].shape)
+    self.assertIn('%s/%s' % (cnma.LOSS_KEY_PREFIX, cnma.BOX_OFFSET),
+                  losses_output)
+    self.assertEqual((), losses_output['%s/%s' % (
+        cnma.LOSS_KEY_PREFIX, cnma.BOX_OFFSET)].shape)
+
+    self.assertIn('detection_scores', postprocess_output)
+    self.assertEqual(postprocess_output['detection_scores'].shape,
+                     (batch_size, max_boxes))
+    self.assertIn('detection_multiclass_scores', postprocess_output)
+    self.assertEqual(postprocess_output['detection_multiclass_scores'].shape,
+                     (batch_size, max_boxes, num_classes))
+    self.assertIn('detection_classes', postprocess_output)
+    self.assertEqual(postprocess_output['detection_classes'].shape,
+                     (batch_size, max_boxes))
+    self.assertIn('num_detections', postprocess_output)
+    self.assertEqual(postprocess_output['num_detections'].shape,
+                     (batch_size,))
+    self.assertIn('detection_boxes', postprocess_output)
+    self.assertEqual(postprocess_output['detection_boxes'].shape,
+                     (batch_size, max_boxes, 4))
+    self.assertIn('detection_boxes_strided', postprocess_output)
+    self.assertEqual(postprocess_output['detection_boxes_strided'].shape,
+                     (batch_size, max_boxes, 4))
+
+    self.assertIn(cnma.OBJECT_CENTER, predictions)
+    self.assertEqual(predictions[cnma.OBJECT_CENTER][0].shape,
+                     (batch_size, height, width // stride, num_classes))
+    self.assertIn(cnma.BOX_SCALE, predictions)
+    self.assertEqual(predictions[cnma.BOX_SCALE][0].shape,
+                     (batch_size, height, width // stride, 2))
+    self.assertIn(cnma.BOX_OFFSET, predictions)
+    self.assertEqual(predictions[cnma.BOX_OFFSET][0].shape,
+                     (batch_size, height, width // stride, 2))
+    self.assertIn('preprocessed_inputs', predictions)
 
 
 if __name__ == '__main__':

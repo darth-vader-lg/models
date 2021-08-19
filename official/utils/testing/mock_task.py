@@ -51,7 +51,7 @@ class MockTask(base_task.Task):
   def build_model(self, *arg, **kwargs):
     inputs = tf.keras.layers.Input(shape=(2,), name="random", dtype=tf.float32)
     outputs = tf.keras.layers.Dense(
-        1, bias_initializer=tf.keras.initializers.Ones())(
+        1, bias_initializer=tf.keras.initializers.Ones(), name="dense_0")(
             inputs)
     network = tf.keras.Model(inputs=inputs, outputs=outputs)
     return MockModel(network)
@@ -62,7 +62,7 @@ class MockTask(base_task.Task):
 
   def validation_step(self, inputs, model: tf.keras.Model, metrics=None):
     logs = super().validation_step(inputs, model, metrics)
-    logs["counter"] = tf.ones((1,), dtype=tf.float32)
+    logs["counter"] = tf.constant(1, dtype=tf.float32)
     return logs
 
   def build_inputs(self, params):

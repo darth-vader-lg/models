@@ -17,6 +17,9 @@
 
 import functools
 import sys
+
+from absl import logging
+
 from object_detection.builders import anchor_generator_builder
 from object_detection.builders import box_coder_builder
 from object_detection.builders import box_predictor_builder
@@ -31,6 +34,7 @@ from object_detection.core import post_processing
 from object_detection.core import target_assigner
 from object_detection.meta_architectures import center_net_meta_arch
 from object_detection.meta_architectures import context_rcnn_meta_arch
+from object_detection.meta_architectures import deepmac_meta_arch
 from object_detection.meta_architectures import faster_rcnn_meta_arch
 from object_detection.meta_architectures import rfcn_meta_arch
 from object_detection.meta_architectures import ssd_meta_arch
@@ -168,8 +172,7 @@ if tf_version.is_tf2():
       'mobilenet_v2_fpn':
           center_net_mobilenet_v2_fpn_feature_extractor.mobilenet_v2_fpn,
       'mobilenet_v2_fpn_sep_conv':
-          center_net_mobilenet_v2_fpn_feature_extractor
-          .mobilenet_v2_fpn_sep_conv,
+          center_net_mobilenet_v2_fpn_feature_extractor.mobilenet_v2_fpn,
   }
 
   FEATURE_EXTRACTOR_MAPS = [
@@ -857,6 +860,25 @@ def keypoint_proto_to_params(kp_config, keypoint_map_dict):
     for label, value in kp_config.keypoint_label_to_std.items():
       keypoint_std_dev_dict[label] = value
   keypoint_std_dev = [keypoint_std_dev_dict[label] for label in keypoint_labels]
+  if kp_config.HasField('heatmap_head_params'):
+    heatmap_head_num_filters = list(kp_config.heatmap_head_params.num_filters)
+    heatmap_head_kernel_sizes = list(kp_config.heatmap_head_params.kernel_sizes)
+  else:
+    heatmap_head_num_filters = [256]
+    heatmap_head_kernel_sizes = [3]
+  if kp_config.HasField('offset_head_params'):
+    offset_head_num_filters = list(kp_config.offset_head_params.num_filters)
+    offset_head_kernel_sizes = list(kp_config.offset_head_params.kernel_sizes)
+  else:
+    offset_head_num_filters = [256]
+    offset_head_kernel_sizes = [3]
+  if kp_config.HasField('regress_head_params'):
+    regress_head_num_filters = list(kp_config.regress_head_params.num_filters)
+    regress_head_kernel_sizes = list(
+        kp_config.regress_head_params.kernel_sizes)
+  else:
+    regress_head_num_filters = [256]
+    regress_head_kernel_sizes = [3]
   return center_net_meta_arch.KeypointEstimationParams(
       task_name=kp_config.task_name,
       class_id=label_map_item.id - CLASS_ID_OFFSET,
@@ -885,7 +907,13 @@ def keypoint_proto_to_params(kp_config, keypoint_map_dict):
       keypoint_depth_loss_weight=kp_config.keypoint_depth_loss_weight,
       score_distance_offset=kp_config.score_distance_offset,
       clip_out_of_frame_keypoints=kp_config.clip_out_of_frame_keypoints,
-      rescore_instances=kp_config.rescore_instances)
+      rescore_instances=kp_config.rescore_instances,
+      heatmap_head_num_filters=heatmap_head_num_filters,
+      heatmap_head_kernel_sizes=heatmap_head_kernel_sizes,
+      offset_head_num_filters=offset_head_num_filters,
+      offset_head_kernel_sizes=offset_head_kernel_sizes,
+      regress_head_num_filters=regress_head_num_filters,
+      regress_head_kernel_sizes=regress_head_kernel_sizes)
 
 
 def object_detection_proto_to_params(od_config):
@@ -898,11 +926,27 @@ def object_detection_proto_to_params(od_config):
       losses_pb2.WeightedSigmoidClassificationLoss())
   loss.localization_loss.CopyFrom(od_config.localization_loss)
   _, localization_loss, _, _, _, _, _ = (losses_builder.build(loss))
+  if od_config.HasField('scale_head_params'):
+    scale_head_num_filters = list(od_config.scale_head_params.num_filters)
+    scale_head_kernel_sizes = list(od_config.scale_head_params.kernel_sizes)
+  else:
+    scale_head_num_filters = [256]
+    scale_head_kernel_sizes = [3]
+  if od_config.HasField('offset_head_params'):
+    offset_head_num_filters = list(od_config.offset_head_params.num_filters)
+    offset_head_kernel_sizes = list(od_config.offset_head_params.kernel_sizes)
+  else:
+    offset_head_num_filters = [256]
+    offset_head_kernel_sizes = [3]
   return center_net_meta_arch.ObjectDetectionParams(
       localization_loss=localization_loss,
       scale_loss_weight=od_config.scale_loss_weight,
       offset_loss_weight=od_config.offset_loss_weight,
-      task_loss_weight=od_config.task_loss_weight)
+      task_loss_weight=od_config.task_loss_weight,
+      scale_head_num_filters=scale_head_num_filters,
+      scale_head_kernel_sizes=scale_head_kernel_sizes,
+      offset_head_num_filters=offset_head_num_filters,
+      offset_head_kernel_sizes=offset_head_kernel_sizes)
 
 
 def object_center_proto_to_params(oc_config):
@@ -918,6 +962,13 @@ def object_center_proto_to_params(oc_config):
   keypoint_weights_for_center = []
   if oc_config.keypoint_weights_for_center:
     keypoint_weights_for_center = list(oc_config.keypoint_weights_for_center)
+
+  if oc_config.HasField('center_head_params'):
+    center_head_num_filters = list(oc_config.center_head_params.num_filters)
+    center_head_kernel_sizes = list(oc_config.center_head_params.kernel_sizes)
+  else:
+    center_head_num_filters = [256]
+    center_head_kernel_sizes = [3]
   return center_net_meta_arch.ObjectCenterParams(
       classification_loss=classification_loss,
       object_center_loss_weight=oc_config.object_center_loss_weight,
@@ -925,7 +976,9 @@ def object_center_proto_to_params(oc_config):
       min_box_overlap_iou=oc_config.min_box_overlap_iou,
       max_box_predictions=oc_config.max_box_predictions,
       use_labeled_classes=oc_config.use_labeled_classes,
-      keypoint_weights_for_center=keypoint_weights_for_center)
+      keypoint_weights_for_center=keypoint_weights_for_center,
+      center_head_num_filters=center_head_num_filters,
+      center_head_kernel_sizes=center_head_kernel_sizes)
 
 
 def mask_proto_to_params(mask_config):
@@ -936,13 +989,21 @@ def mask_proto_to_params(mask_config):
       losses_pb2.WeightedL2LocalizationLoss())
   loss.classification_loss.CopyFrom(mask_config.classification_loss)
   classification_loss, _, _, _, _, _, _ = (losses_builder.build(loss))
+  if mask_config.HasField('mask_head_params'):
+    mask_head_num_filters = list(mask_config.mask_head_params.num_filters)
+    mask_head_kernel_sizes = list(mask_config.mask_head_params.kernel_sizes)
+  else:
+    mask_head_num_filters = [256]
+    mask_head_kernel_sizes = [3]
   return center_net_meta_arch.MaskParams(
       classification_loss=classification_loss,
       task_loss_weight=mask_config.task_loss_weight,
       mask_height=mask_config.mask_height,
       mask_width=mask_config.mask_width,
       score_threshold=mask_config.score_threshold,
-      heatmap_bias_init=mask_config.heatmap_bias_init)
+      heatmap_bias_init=mask_config.heatmap_bias_init,
+      mask_head_num_filters=mask_head_num_filters,
+      mask_head_kernel_sizes=mask_head_kernel_sizes)
 
 
 def densepose_proto_to_params(densepose_config):
@@ -1020,6 +1081,21 @@ def _build_center_net_model(center_net_config, is_training, add_summaries):
     object_detection_params = object_detection_proto_to_params(
         center_net_config.object_detection_task)
 
+  if center_net_config.HasField('deepmac_mask_estimation'):
+    logging.warn(('Building experimental DeepMAC meta-arch.'
+                  ' Some features may be omitted.'))
+    deepmac_params = deepmac_meta_arch.deepmac_proto_to_params(
+        center_net_config.deepmac_mask_estimation)
+    return deepmac_meta_arch.DeepMACMetaArch(
+        is_training=is_training,
+        add_summaries=add_summaries,
+        num_classes=center_net_config.num_classes,
+        feature_extractor=feature_extractor,
+        image_resizer_fn=image_resizer_fn,
+        object_center_params=object_center_params,
+        object_detection_params=object_detection_params,
+        deepmac_params=deepmac_params)
+
   keypoint_params_dict = None
   if center_net_config.keypoint_estimation_task:
     label_map_proto = label_map_util.load_labelmap(
@@ -1064,6 +1140,7 @@ def _build_center_net_model(center_net_config, is_training, add_summaries):
   if center_net_config.HasField('post_processing'):
     non_max_suppression_fn, _ = post_processing_builder.build(
         center_net_config.post_processing)
+
   return center_net_meta_arch.CenterNetMetaArch(
       is_training=is_training,
       add_summaries=add_summaries,
@@ -1088,10 +1165,23 @@ def _build_center_net_feature_extractor(feature_extractor_config, is_training):
   if feature_extractor_config.type not in CENTER_NET_EXTRACTOR_FUNCTION_MAP:
     raise ValueError('\'{}\' is not a known CenterNet feature extractor type'
                      .format(feature_extractor_config.type))
+  # For backwards compatibility:
+  use_separable_conv = (
+      feature_extractor_config.use_separable_conv or
+      feature_extractor_config.type == 'mobilenet_v2_fpn_sep_conv')
   kwargs = {
-      'channel_means': list(feature_extractor_config.channel_means),
-      'channel_stds': list(feature_extractor_config.channel_stds),
-      'bgr_ordering': feature_extractor_config.bgr_ordering,
+      'channel_means':
+          list(feature_extractor_config.channel_means),
+      'channel_stds':
+          list(feature_extractor_config.channel_stds),
+      'bgr_ordering':
+          feature_extractor_config.bgr_ordering,
+      'depth_multiplier':
+          feature_extractor_config.depth_multiplier,
+      'use_separable_conv':
+          use_separable_conv,
+      'upsampling_interpolation':
+          feature_extractor_config.upsampling_interpolation,
   }
 
 

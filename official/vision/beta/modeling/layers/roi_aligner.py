@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Contains definitions of ROI aligner."""
 
+from typing import Mapping
 import tensorflow as tf
 
 from official.vision.beta.ops import spatial_transform_ops
@@ -23,10 +24,7 @@ from official.vision.beta.ops import spatial_transform_ops
 class MultilevelROIAligner(tf.keras.layers.Layer):
   """Performs ROIAlign for the second stage processing."""
 
-  def __init__(self,
-               crop_size=7,
-               sample_offset=0.5,
-               **kwargs):
+  def __init__(self, crop_size: int = 7, sample_offset: float = 0.5, **kwargs):
     """Initializes a ROI aligner.
 
     Args:
@@ -40,7 +38,10 @@ class MultilevelROIAligner(tf.keras.layers.Layer):
     }
     super(MultilevelROIAligner, self).__init__(**kwargs)
 
-  def call(self, features, boxes, training=None):
+  def call(self,
+           features: Mapping[str, tf.Tensor],
+           boxes: tf.Tensor,
+           training: bool = None):
     """Generates ROIs.
 
     Args:

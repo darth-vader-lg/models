@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Contains definitions of box sampler."""
 
 # Import libraries
@@ -25,8 +25,8 @@ class BoxSampler(tf.keras.layers.Layer):
   """Creates a BoxSampler to sample positive and negative boxes."""
 
   def __init__(self,
-               num_samples=512,
-               foreground_fraction=0.25,
+               num_samples: int = 512,
+               foreground_fraction: float = 0.25,
                **kwargs):
     """Initializes a box sampler.
 
@@ -42,7 +42,8 @@ class BoxSampler(tf.keras.layers.Layer):
     }
     super(BoxSampler, self).__init__(**kwargs)
 
-  def call(self, positive_matches, negative_matches, ignored_matches):
+  def call(self, positive_matches: tf.Tensor, negative_matches: tf.Tensor,
+           ignored_matches: tf.Tensor):
     """Samples and selects positive and negative instances.
 
     Args:

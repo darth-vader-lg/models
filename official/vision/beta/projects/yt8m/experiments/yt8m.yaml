@@ -13,11 +13,11 @@ task:
     name: 'yt8m'
     split: 'train'
     feature_sizes: !!python/tuple
-      - 1024
-      - 128
+    - 1024
+    - 128
     feature_names: !!python/tuple
-      - "rgb"
-      - "audio"
+    - "rgb"
+    - "audio"
     segment_size: 1
     segment_labels: false
     temporal_stride: 1
@@ -32,11 +32,11 @@ task:
     name: 'yt8m'
     split: 'train'
     feature_sizes: !!python/tuple
-      - 1024
-      - 128
+    - 1024
+    - 128
     feature_names: !!python/tuple
-      - "rgb"
-      - "audio"
+    - "rgb"
+    - "audio"
     segment_size: 1
     segment_labels: true
     temporal_stride: 1

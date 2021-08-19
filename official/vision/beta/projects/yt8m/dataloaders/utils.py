@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,15 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """Contains a collection of util functions for training and evaluating."""
 
+from absl import logging
 import numpy
 import tensorflow as tf
-from absl import logging
-
-# from tensorflow import logging
-Xrange = range  # Python 3
 
 
 def Dequantize(feat_vector, max_quantized_value=2, min_quantized_value=-2):
@@ -141,9 +138,7 @@ def AddEpochSummary(summary_writer,
 
 
 def GetListOfFeatureNamesAndSizes(feature_names, feature_sizes):
-  """Extract the list of feature names and the dimensionality of each feature
-
-     from string of comma separated values.
+  """Extract the list of feature names and the dimensionality.
 
   Args:
     feature_names: string containing comma separated list of feature names
@@ -160,9 +155,10 @@ def GetListOfFeatureNamesAndSizes(feature_names, feature_sizes):
       int(feature_sizes) for feature_sizes in feature_sizes.split(",")
   ]
   if len(list_of_feature_names) != len(list_of_feature_sizes):
-    logging.error("length of the feature names (=" +
-                  str(len(list_of_feature_names)) + ") != length of feature "
-                  "sizes (=" + str(len(list_of_feature_sizes)) + ")")
+    logging.error(
+        "length of the feature names (=%r) != length of feature "
+        "sizes (=%r)", str(len(list_of_feature_names)),
+        str(len(list_of_feature_sizes)))
 
   return list_of_feature_names, list_of_feature_sizes
 
@@ -207,8 +203,8 @@ def CombineGradients(tower_grads):
       [x for x in grad_list if x[0] is not None] for grad_list in tower_grads
   ]
   final_grads = []
-  for i in Xrange(len(filtered_grads[0])):
-    grads = [filtered_grads[t][i] for t in Xrange(len(filtered_grads))]
+  for i in range(len(filtered_grads[0])):
+    grads = [filtered_grads[t][i] for t in range(len(filtered_grads))]
     grad = tf.stack([x[0] for x in grads], 0)
     grad = tf.reduce_sum(grad, 0)
     final_grads.append((

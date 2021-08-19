@@ -1,5 +1,4 @@
-# Lint as: python3
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
+
 """RetinaNet task definition."""
+from typing import Any, Optional, List, Tuple, Mapping
 
 from absl import logging
 import tensorflow as tf
@@ -84,7 +84,9 @@ class RetinaNetTask(base_task.Task):
     logging.info('Finished loading pretrained checkpoint from %s',
                  ckpt_dir_or_file)
 
-  def build_inputs(self, params, input_context=None):
+  def build_inputs(self,
+                   params: exp_cfg.DataConfig,
+                   input_context: Optional[tf.distribute.InputContext] = None):
     """Build input dataset."""
 
     if params.tfds_name:
@@ -131,9 +133,54 @@ class RetinaNetTask(base_task.Task):
 
     return dataset
 
-  def build_losses(self, outputs, labels, aux_losses=None):
+  def build_attribute_loss(self,
+                           attribute_heads: List[exp_cfg.AttributeHead],
+                           outputs: Mapping[str, Any],
+                           labels: Mapping[str, Any],
+                           box_sample_weight: tf.Tensor) -> float:
+    """Computes attribute loss.
+
+    Args:
+      attribute_heads: a list of attribute head configs.
+      outputs: RetinaNet model outputs.
+      labels: RetinaNet labels.
+      box_sample_weight: normalized bounding box sample weights.
+
+    Returns:
+      Attribute loss of all attribute heads.
+    """
+    attribute_loss = 0.0
+    for head in attribute_heads:
+      if head.name not in labels['attribute_targets']:
+        raise ValueError(f'Attribute {head.name} not found in label targets.')
+      if head.name not in outputs['attribute_outputs']:
+        raise ValueError(f'Attribute {head.name} not found in model outputs.')
+
+      y_true_att = keras_cv.losses.multi_level_flatten(
+          labels['attribute_targets'][head.name], last_dim=head.size)
+      y_pred_att = keras_cv.losses.multi_level_flatten(
+          outputs['attribute_outputs'][head.name], last_dim=head.size)
+      if head.type == 'regression':
+        att_loss_fn = tf.keras.losses.Huber(
+            1.0, reduction=tf.keras.losses.Reduction.SUM)
+        att_loss = att_loss_fn(
+            y_true=y_true_att,
+            y_pred=y_pred_att,
+            sample_weight=box_sample_weight)
+      else:
+        raise ValueError(f'Attribute type {head.type} not supported.')
+      attribute_loss += att_loss
+
+    return attribute_loss
+
+  def build_losses(self,
+                   outputs: Mapping[str, Any],
+                   labels: Mapping[str, Any],
+                   aux_losses: Optional[Any] = None):
     """Build RetinaNet losses."""
     params = self.task_config
+    attribute_heads = self.task_config.model.head.attribute_heads
+
     cls_loss_fn = keras_cv.losses.FocalLoss(
         alpha=params.losses.focal_loss_alpha,
         gamma=params.losses.focal_loss_gamma,
@@ -165,6 +212,10 @@ class RetinaNetTask(base_task.Task):
 
     model_loss = cls_loss + params.losses.box_loss_weight * box_loss
 
+    if attribute_heads:
+      model_loss += self.build_attribute_loss(attribute_heads, outputs, labels,
+                                              box_sample_weight)
+
     total_loss = model_loss
     if aux_losses:
       reg_loss = tf.reduce_sum(aux_losses)
@@ -172,7 +223,7 @@ class RetinaNetTask(base_task.Task):
 
     return total_loss, cls_loss, box_loss, model_loss
 
-  def build_metrics(self, training=True):
+  def build_metrics(self, training: bool = True):
     """Build detection metrics."""
     metrics = []
     metric_names = ['total_loss', 'cls_loss', 'box_loss', 'model_loss']
@@ -190,7 +241,11 @@ class RetinaNetTask(base_task.Task):
 
     return metrics
 
-  def train_step(self, inputs, model, optimizer, metrics=None):
+  def train_step(self,
+                 inputs: Tuple[Any, Any],
+                 model: tf.keras.Model,
+                 optimizer: tf.keras.optimizers.Optimizer,
+                 metrics: Optional[List[Any]] = None):
     """Does forward and backward.
 
     Args:
@@ -241,7 +296,10 @@ class RetinaNetTask(base_task.Task):
 
     return logs
 
-  def validation_step(self, inputs, model, metrics=None):
+  def validation_step(self,
+                      inputs: Tuple[Any, Any],
+                      model: tf.keras.Model,
+                      metrics: Optional[List[Any]] = None):
     """Validatation step.
 
     Args:

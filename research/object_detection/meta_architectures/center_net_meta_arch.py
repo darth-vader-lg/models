@@ -21,7 +21,6 @@
 import abc
 import collections
 import functools
-import numpy as np
 import tensorflow.compat.v1 as tf
 import tensorflow.compat.v2 as tf2
 
@@ -118,27 +117,14 @@ class CenterNetFeatureExtractor(tf.keras.Model):
     pass
 
   @property
-  @abc.abstractmethod
-  def supported_sub_model_types(self):
-    """Valid sub model types supported by the get_sub_model function."""
-    pass
-
-  @abc.abstractmethod
-  def get_sub_model(self, sub_model_type):
-    """Returns the underlying keras model for the given sub_model_type.
-
-    This function is useful when we only want to get a subset of weights to
-    be restored from a checkpoint.
-
-    Args:
-      sub_model_type: string, the type of sub model. Currently, CenterNet
-        feature extractors support 'detection' and 'classification'.
-    """
-    pass
+  def classification_backbone(self):
+    raise NotImplementedError(
+        'Classification backbone not supported for {}'.format(type(self)))
 
 
-def make_prediction_net(num_out_channels, kernel_size=3, num_filters=256,
-                        bias_fill=None, use_depthwise=False, name=None):
+def make_prediction_net(num_out_channels, kernel_sizes=(3), num_filters=(256),
+                        bias_fill=None, use_depthwise=False, name=None,
+                        unit_height_conv=True):
   """Creates a network to predict the given number of output channels.
 
   This function is intended to make the prediction heads for the CenterNet
@@ -146,19 +132,29 @@ def make_prediction_net(num_out_channels, kernel_size=3, num_filters=256,
 
   Args:
     num_out_channels: Number of output channels.
-    kernel_size: The size of the conv kernel in the intermediate layer
-    num_filters: The number of filters in the intermediate conv layer.
+    kernel_sizes: A list representing the sizes of the conv kernel in the
+      intermediate layer. Note that the length of the list indicates the number
+      of intermediate conv layers and it must be the same as the length of the
+      num_filters.
+    num_filters: A list representing the number of filters in the intermediate
+      conv layer. Note that the length of the list indicates the number of
+      intermediate conv layers.
     bias_fill: If not None, is used to initialize the bias in the final conv
       layer.
     use_depthwise: If true, use SeparableConv2D to construct the Sequential
       layers instead of Conv2D.
     name: Optional name for the prediction net.
+    unit_height_conv: If True, Conv2Ds have asymmetric kernels with height=1.
 
   Returns:
     net: A keras module which when called on an input tensor of size
       [batch_size, height, width, num_in_channels] returns an output
       of size [batch_size, height, width, num_out_channels]
   """
+  if isinstance(kernel_sizes, int) and isinstance(num_filters, int):
+    kernel_sizes = [kernel_sizes]
+    num_filters = [num_filters]
+  assert len(kernel_sizes) == len(num_filters)
   if use_depthwise:
     conv_fn = tf.keras.layers.SeparableConv2D
   else:
@@ -175,16 +171,18 @@ def make_prediction_net(num_out_channels, kernel_size=3, num_filters=256,
   if bias_fill is not None:
     out_conv.bias_initializer = tf.keras.initializers.constant(bias_fill)
 
-  net = tf.keras.Sequential([
-      conv_fn(
-          num_filters,
-          kernel_size=kernel_size,
-          padding='same',
-          name='conv2' if tf_version.is_tf1() else None),
-      tf.keras.layers.ReLU(), out_conv
-  ],
-                            name=name)
-
+  layers = []
+  for idx, (kernel_size,
+            num_filter) in enumerate(zip(kernel_sizes, num_filters)):
+    layers.append(
+        conv_fn(
+            num_filter,
+            kernel_size=[1, kernel_size] if unit_height_conv else kernel_size,
+            padding='same',
+            name='conv2_%d' % idx if tf_version.is_tf1() else None))
+    layers.append(tf.keras.layers.ReLU())
+  layers.append(out_conv)
+  net = tf.keras.Sequential(layers, name=name)
   return net
 
 
@@ -350,6 +348,8 @@ def prediction_tensors_to_boxes(y_indices, x_indices, height_width_predictions,
       the raw bounding box coordinates of boxes.
   """
   batch_size, num_boxes = _get_shape(y_indices, 2)
+  _, height, width, _ = _get_shape(height_width_predictions, 4)
+  height, width = tf.cast(height, tf.float32), tf.cast(width, tf.float32)
 
   # TF Lite does not support tf.gather with batch_dims > 0, so we need to use
   # tf_gather_nd instead and here we prepare the indices for that.
@@ -371,10 +371,16 @@ def prediction_tensors_to_boxes(y_indices, x_indices, height_width_predictions,
   heights, widths = tf.unstack(height_width, axis=2)
   y_offsets, x_offsets = tf.unstack(offsets, axis=2)
 
-  boxes = tf.stack([y_indices + y_offsets - heights / 2.0,
-                    x_indices + x_offsets - widths / 2.0,
-                    y_indices + y_offsets + heights / 2.0,
-                    x_indices + x_offsets + widths / 2.0], axis=2)
+  ymin = y_indices + y_offsets - heights / 2.0
+  xmin = x_indices + x_offsets - widths / 2.0
+  ymax = y_indices + y_offsets + heights / 2.0
+  xmax = x_indices + x_offsets + widths / 2.0
+
+  ymin = tf.clip_by_value(ymin, 0., height)
+  xmin = tf.clip_by_value(xmin, 0., width)
+  ymax = tf.clip_by_value(ymax, 0., height)
+  xmax = tf.clip_by_value(xmax, 0., width)
+  boxes = tf.stack([ymin, xmin, ymax, xmax], axis=2)
 
   return boxes
 
@@ -545,23 +551,141 @@ def prediction_tensors_to_keypoint_candidates(keypoint_heatmap_predictions,
   return keypoint_candidates, keypoint_scores, num_candidates, depth_candidates
 
 
-def prediction_to_single_instance_keypoints(object_heatmap,
-                                            keypoint_heatmap,
-                                            keypoint_offset,
-                                            keypoint_regression,
-                                            stride,
-                                            object_center_std_dev,
-                                            keypoint_std_dev,
-                                            kp_params,
-                                            keypoint_depths=None):
+def argmax_feature_map_locations(feature_map):
+  """Returns the peak locations in the feature map."""
+  batch_size, _, width, num_channels = _get_shape(feature_map, 4)
+
+  feature_map_flattened = tf.reshape(
+      feature_map, [batch_size, -1, num_channels])
+  peak_flat_indices = tf.math.argmax(
+      feature_map_flattened, axis=1, output_type=tf.dtypes.int32)
+  # Get x and y indices corresponding to the top indices in the flat array.
+  y_indices, x_indices = (
+      row_col_indices_from_flattened_indices(peak_flat_indices, width))
+  channel_indices = tf.tile(
+      tf.range(num_channels)[tf.newaxis, :], [batch_size, 1])
+  return y_indices, x_indices, channel_indices
+
+
+def prediction_tensors_to_single_instance_kpts(
+    keypoint_heatmap_predictions,
+    keypoint_heatmap_offsets,
+    keypoint_score_heatmap=None):
+  """Convert keypoint heatmap predictions and offsets to keypoint candidates.
+
+  Args:
+    keypoint_heatmap_predictions: A float tensor of shape [batch_size, height,
+      width, num_keypoints] representing the per-keypoint heatmaps which is
+      used for finding the best keypoint candidate locations.
+    keypoint_heatmap_offsets: A float tensor of shape [batch_size, height,
+      width, 2] (or [batch_size, height, width, 2 * num_keypoints] if
+      'per_keypoint_offset' is set True) representing the per-keypoint offsets.
+    keypoint_score_heatmap: (optional) A float tensor of shape [batch_size,
+      height, width, num_keypoints] representing the heatmap which is used for
+      reporting the confidence scores. If not provided, then the values in the
+      keypoint_heatmap_predictions will be used.
+
+  Returns:
+    keypoint_candidates: A tensor of shape
+      [batch_size, max_candidates, num_keypoints, 2] holding the
+      location of keypoint candidates in [y, x] format (expressed in absolute
+      coordinates in the output coordinate frame).
+    keypoint_scores: A float tensor of shape
+      [batch_size, max_candidates, num_keypoints] with the scores for each
+      keypoint candidate. The scores come directly from the heatmap predictions.
+    num_keypoint_candidates: An integer tensor of shape
+      [batch_size, num_keypoints] with the number of candidates for each
+      keypoint type, as it's possible to filter some candidates due to the score
+      threshold.
+  """
+  batch_size, height, width, num_keypoints = _get_shape(
+      keypoint_heatmap_predictions, 4)
+  # Get x, y and channel indices corresponding to the top indices in the
+  # keypoint heatmap predictions.
+  y_indices, x_indices, channel_indices = argmax_feature_map_locations(
+      keypoint_heatmap_predictions)
+
+  # TF Lite does not support tf.gather with batch_dims > 0, so we need to use
+  # tf_gather_nd instead and here we prepare the indices for that.
+  _, num_keypoints = _get_shape(y_indices, 2)
+  combined_indices = tf.stack([
+      _multi_range(batch_size, value_repetitions=num_keypoints),
+      tf.reshape(y_indices, [-1]),
+      tf.reshape(x_indices, [-1]),
+      tf.reshape(channel_indices, [-1])
+  ], axis=1)
+
+  # Reshape the offsets predictions to shape:
+  # [batch_size, height, width, num_keypoints, 2]
+  keypoint_heatmap_offsets = tf.reshape(
+      keypoint_heatmap_offsets, [batch_size, height, width, num_keypoints, -1])
+
+  # shape: [num_keypoints, 2]
+  selected_offsets_flat = tf.gather_nd(keypoint_heatmap_offsets,
+                                       combined_indices)
+  y_offsets, x_offsets = tf.unstack(selected_offsets_flat, axis=1)
+
+  keypoint_candidates = tf.stack([
+      tf.cast(y_indices, dtype=tf.float32) + tf.expand_dims(y_offsets, axis=0),
+      tf.cast(x_indices, dtype=tf.float32) + tf.expand_dims(x_offsets, axis=0)
+  ], axis=2)
+  keypoint_candidates = tf.expand_dims(keypoint_candidates, axis=0)
+  if keypoint_score_heatmap is None:
+    keypoint_scores = tf.gather_nd(
+        keypoint_heatmap_predictions, combined_indices)
+  else:
+    keypoint_scores = tf.gather_nd(keypoint_score_heatmap, combined_indices)
+  keypoint_scores = tf.expand_dims(
+      tf.expand_dims(keypoint_scores, axis=0), axis=0)
+  return keypoint_candidates, keypoint_scores
+
+
+def _score_to_distance_map(y_grid, x_grid, heatmap, points_y, points_x,
+                           score_distance_offset):
+  """Rescores heatmap using the distance information.
+
+  Rescore the heatmap scores using the formula:
+  score / (d + score_distance_offset), where the d is the distance from each
+  pixel location to the target point location.
+
+  Args:
+    y_grid: A float tensor with shape [height, width] representing the
+      y-coordinate of each pixel grid.
+    x_grid: A float tensor with shape [height, width] representing the
+      x-coordinate of each pixel grid.
+    heatmap: A float tensor with shape [1, height, width, channel]
+      representing the heatmap to be rescored.
+    points_y: A float tensor with shape [channel] representing the y
+      coordinates of the target points for each channel.
+    points_x: A float tensor with shape [channel] representing the x
+      coordinates of the target points for each channel.
+    score_distance_offset: A constant used in the above formula.
+
+  Returns:
+    A float tensor with shape [1, height, width, channel] representing the
+    rescored heatmap.
+  """
+  y_diff = y_grid[:, :, tf.newaxis] - points_y
+  x_diff = x_grid[:, :, tf.newaxis] - points_x
+  distance = tf.math.sqrt(y_diff**2 + x_diff**2)
+  return tf.math.divide(heatmap, distance + score_distance_offset)
+
+
+def prediction_to_single_instance_keypoints(
+    object_heatmap,
+    keypoint_heatmap,
+    keypoint_offset,
+    keypoint_regression,
+    kp_params,
+    keypoint_depths=None):
   """Postprocess function to predict single instance keypoints.
 
   This is a simplified postprocessing function based on the assumption that
   there is only one instance in the image. If there are multiple instances in
   the image, the model prefers to predict the one that is closest to the image
   center. Here is a high-level description of what this function does:
-    1) Object heatmap re-weighted by image center Gaussian is used to determine
-       the instance center.
+    1) Object heatmap re-weighted by the distance between each pixel to the
+       image center is used to determine the instance center.
     2) Regressed keypoint locations are retrieved from the instance center. The
        Gaussian kernel is applied to the regressed keypoint locations to
        re-weight the keypoint heatmap. This is to select the keypoints that are
@@ -579,16 +703,6 @@ def prediction_to_single_instance_keypoints(object_heatmap,
       representing the per-keypoint offsets.
     keypoint_regression: A float  tensor of shape [1, height, width, 2 *
       num_keypoints] representing the joint regression prediction.
-    stride: The stride in the output space.
-    object_center_std_dev: The standard deviation of the Gaussian mask which is
-      applied to the object_heatmap. The goal is to upweight the instance that
-      is closer to the image center. Expressed in units of input image pixels.
-    keypoint_std_dev: The standard deviation of the Gaussian masks which are
-      applied to the keypoint_heatmap based on the regressed joint location. It
-      is used to upweight the keypoint joints that belongs to the targeted
-      instance. If keypoint_std_dev contains 1 element, all keypoint joints will
-      share the same value. Otherwise, it must contain num_keypoints elements,
-      representing the standard deviation corresponding to each joint.
     kp_params: A `KeypointEstimationParams` object with parameters for a single
       keypoint class.
     keypoint_depths: (optional) A float tensor of shape [batch_size, height,
@@ -602,33 +716,29 @@ def prediction_to_single_instance_keypoints(object_heatmap,
         map space.
       keypoint_scores: A float tensor with shape [1, 1, num_keypoints]
         representing the keypoint prediction scores.
-      keypoint_depths: A float tensor with shape [1, 1, num_keypoints]
-        representing the estimated keypoint depths. Return None if the input
-        keypoint_depths is None.
 
   Raises:
     ValueError: if the input keypoint_std_dev doesn't have valid number of
       elements (1 or num_keypoints).
   """
+  # TODO(yuhuic): add the keypoint depth prediction logics in the browser
+  # postprocessing back.
+  del keypoint_depths
+
   num_keypoints = len(kp_params.keypoint_std_dev)
   batch_size, height, width, _ = _get_shape(keypoint_heatmap, 4)
 
-  # Apply the Gaussian mask to the image center.
+  # Create the image center location.
   image_center_y = tf.convert_to_tensor([0.5 * height], dtype=tf.float32)
   image_center_x = tf.convert_to_tensor([0.5 * width], dtype=tf.float32)
   (y_grid, x_grid) = ta_utils.image_shape_to_grids(height, width)
-  # Mask shape: [1, height, width, 1]
-  object_mask = tf.expand_dims(
-      ta_utils.coordinates_to_heatmap(y_grid, x_grid, image_center_y,
-                                      image_center_x,
-                                      object_center_std_dev / stride,
-                                      tf.one_hot(tf.range(1), depth=1)), axis=0)
-  object_heatmap = tf.math.multiply(object_heatmap, object_mask)
+  # Rescore the object heatmap by the distnace to the image center.
+  object_heatmap = _score_to_distance_map(
+      y_grid, x_grid, object_heatmap, image_center_y,
+      image_center_x, kp_params.score_distance_offset)
 
   # Pick the highest score and location of the weighted object heatmap.
-  _, y_indices, x_indices, _ = (
-      top_k_feature_map_locations(
-          object_heatmap, max_pool_kernel_size=1, k=1, per_channel=True))
+  y_indices, x_indices, _ = argmax_feature_map_locations(object_heatmap)
   _, num_indices = _get_shape(y_indices, 2)
   combined_indices = tf.stack([
       _multi_range(batch_size, value_repetitions=num_indices),
@@ -644,36 +754,24 @@ def prediction_to_single_instance_keypoints(object_heatmap,
   y_regressed = tf.cast(y_indices, dtype=tf.float32) + y_reg
   x_regressed = tf.cast(x_indices, dtype=tf.float32) + x_reg
 
-  # Prepare and apply the keypoint heatmap masks.
-  keypoint_std_dev = [x / stride for x in keypoint_std_dev]
-  if len(keypoint_std_dev) == 1:
-    std_dev = tf.convert_to_tensor(
-        keypoint_std_dev * num_keypoints, dtype=tf.float32)
-  elif len(keypoint_std_dev) == num_keypoints:
-    std_dev = tf.convert_to_tensor(
-        keypoint_std_dev, dtype=tf.float32)
+  if kp_params.candidate_ranking_mode == 'score_distance_ratio':
+    reweighted_keypoint_heatmap = _score_to_distance_map(
+        y_grid, x_grid, keypoint_heatmap, y_regressed, x_regressed,
+        kp_params.score_distance_offset)
   else:
-    raise ValueError('keypoint_std_dev needs to have length either '
-                     'equal to 1 or num_keypoints.')
-  channel_onehot = tf.one_hot(tf.range(num_keypoints), depth=num_keypoints)
-  keypoint_mask = tf.expand_dims(
-      ta_utils.coordinates_to_heatmap(y_grid, x_grid, y_regressed, x_regressed,
-                                      std_dev, channel_onehot), axis=0)
-  keypoint_predictions = tf.math.multiply(keypoint_heatmap, keypoint_mask)
+    raise ValueError('Unsupported candidate_ranking_mode: %s' %
+                     kp_params.candidate_ranking_mode)
 
   # Get the keypoint locations/scores:
   #   keypoint_candidates: [1, 1, num_keypoints, 2]
   #   keypoint_scores: [1, 1, num_keypoints]
   #   depth_candidates: [1, 1, num_keypoints]
-  (keypoint_candidates, keypoint_scores, _,
-   depth_candidates) = prediction_tensors_to_keypoint_candidates(
-       keypoint_predictions,
+  (keypoint_candidates, keypoint_scores
+   ) = prediction_tensors_to_single_instance_kpts(
+       reweighted_keypoint_heatmap,
        keypoint_offset,
-       keypoint_score_threshold=kp_params.keypoint_candidate_score_threshold,
-       max_pool_kernel_size=kp_params.peak_max_pool_kernel_size,
-       max_candidates=1,
-       keypoint_depths=keypoint_depths)
-  return keypoint_candidates, keypoint_scores, depth_candidates
+       keypoint_score_heatmap=keypoint_heatmap)
+  return keypoint_candidates, keypoint_scores, None
 
 
 def regressed_keypoints_at_object_centers(regressed_keypoint_predictions,
@@ -830,12 +928,6 @@ def refine_keypoints(regressed_keypoints,
   num_candidates_tiled = tf.tile(tf.expand_dims(num_keypoint_candidates, 1),
                                  [1, max_candidates, 1])
   invalid_candidates = range_tiled >= num_candidates_tiled
-  nan_mask = tf.where(
-      invalid_candidates,
-      np.nan * tf.ones_like(invalid_candidates, dtype=tf.float32),
-      tf.ones_like(invalid_candidates, dtype=tf.float32))
-  keypoint_candidates_with_nans = tf.math.multiply(
-      keypoint_candidates, tf.expand_dims(nan_mask, -1))
 
   # Pairwise squared distances between regressed keypoints and candidate
   # keypoints (for a single keypoint type).
@@ -844,7 +936,7 @@ def refine_keypoints(regressed_keypoints,
                                                axis=2)
   # Shape [batch_size, 1, max_candidates, num_keypoints, 2].
   keypoint_candidates_expanded = tf.expand_dims(
-      keypoint_candidates_with_nans, axis=1)
+      keypoint_candidates, axis=1)
   # Use explicit tensor shape broadcasting (since the tensor dimensions are
   # expanded to 5D) to make it tf.lite compatible.
   regressed_keypoint_expanded = tf.tile(
@@ -858,10 +950,16 @@ def refine_keypoints(regressed_keypoints,
   sqrd_distances = tf.math.reduce_sum(tf.multiply(diff, diff), axis=-1)
   distances = tf.math.sqrt(sqrd_distances)
 
-  # Replace the NaNs with Infs to make sure the following reduce_min/argmin
-  # behaves properly.
+  # Replace the invalid candidated with large constant (10^5) to make sure the
+  # following reduce_min/argmin behaves properly.
+  max_dist = 1e5
   distances = tf.where(
-      tf.math.is_nan(distances), np.inf * tf.ones_like(distances), distances)
+      tf.tile(
+          tf.expand_dims(invalid_candidates, axis=1),
+          multiples=[1, num_instances, 1, 1]),
+      tf.ones_like(distances) * max_dist,
+      distances
+  )
 
   # Determine the candidates that have the minimum distance to the regressed
   # keypoints. Shape [batch_size, num_instances, num_keypoints].
@@ -1133,6 +1231,12 @@ def row_col_channel_indices_from_flattened_indices(indices, num_cols,
       indices.
 
   """
+  # Be careful with this function when running a model in float16 precision
+  # (e.g. TF.js with WebGL) because the array indices may not be represented
+  # accurately if they are too large, resulting in incorrect channel indices.
+  # See:
+  # https://en.wikipedia.org/wiki/Half-precision_floating-point_format#Precision_limitations_on_integer_values
+  #
   # Avoid using mod operator to make the ops more easy to be compatible with
   # different environments, e.g. WASM.
   row_indices = (indices // num_channels) // num_cols
@@ -1141,6 +1245,29 @@ def row_col_channel_indices_from_flattened_indices(indices, num_cols,
   channel_indices = indices - channel_indices_temp * num_channels
 
   return row_indices, col_indices, channel_indices
+
+
+def row_col_indices_from_flattened_indices(indices, num_cols):
+  """Computes row and column indices from flattened indices.
+
+  Args:
+    indices: An integer tensor of any shape holding the indices in the flattened
+      space.
+    num_cols: Number of columns in the image (width).
+
+  Returns:
+    row_indices: The row indices corresponding to each of the input indices.
+      Same shape as indices.
+    col_indices: The column indices corresponding to each of the input indices.
+      Same shape as indices.
+
+  """
+  # Avoid using mod operator to make the ops more easy to be compatible with
+  # different environments, e.g. WASM.
+  row_indices = indices // num_cols
+  col_indices = indices - row_indices * num_cols
+
+  return row_indices, col_indices
 
 
 def get_valid_anchor_weights_in_flattened_image(true_image_shapes, height,
@@ -1541,7 +1668,9 @@ def predicted_embeddings_at_object_centers(embedding_predictions,
 class ObjectDetectionParams(
     collections.namedtuple('ObjectDetectionParams', [
         'localization_loss', 'scale_loss_weight', 'offset_loss_weight',
-        'task_loss_weight'
+        'task_loss_weight', 'scale_head_num_filters',
+        'scale_head_kernel_sizes', 'offset_head_num_filters',
+        'offset_head_kernel_sizes'
     ])):
   """Namedtuple to host object detection related parameters.
 
@@ -1557,7 +1686,11 @@ class ObjectDetectionParams(
               localization_loss,
               scale_loss_weight,
               offset_loss_weight,
-              task_loss_weight=1.0):
+              task_loss_weight=1.0,
+              scale_head_num_filters=(256),
+              scale_head_kernel_sizes=(3),
+              offset_head_num_filters=(256),
+              offset_head_kernel_sizes=(3)):
     """Constructor with default values for ObjectDetectionParams.
 
     Args:
@@ -1570,13 +1703,23 @@ class ObjectDetectionParams(
         depending on the input size.
       offset_loss_weight: float, The weight for localizing center offsets.
       task_loss_weight: float, the weight of the object detection loss.
+      scale_head_num_filters: filter numbers of the convolutional layers used
+        by the object detection box scale prediction head.
+      scale_head_kernel_sizes: kernel size of the convolutional layers used
+        by the object detection box scale prediction head.
+      offset_head_num_filters: filter numbers of the convolutional layers used
+        by the object detection box offset prediction head.
+      offset_head_kernel_sizes: kernel size of the convolutional layers used
+        by the object detection box offset prediction head.
 
     Returns:
       An initialized ObjectDetectionParams namedtuple.
     """
     return super(ObjectDetectionParams,
                  cls).__new__(cls, localization_loss, scale_loss_weight,
-                              offset_loss_weight, task_loss_weight)
+                              offset_loss_weight, task_loss_weight,
+                              scale_head_num_filters, scale_head_kernel_sizes,
+                              offset_head_num_filters, offset_head_kernel_sizes)
 
 
 class KeypointEstimationParams(
@@ -1591,7 +1734,10 @@ class KeypointEstimationParams(
         'offset_peak_radius', 'per_keypoint_offset', 'predict_depth',
         'per_keypoint_depth', 'keypoint_depth_loss_weight',
         'score_distance_offset', 'clip_out_of_frame_keypoints',
-        'rescore_instances'
+        'rescore_instances', 'heatmap_head_num_filters',
+        'heatmap_head_kernel_sizes', 'offset_head_num_filters',
+        'offset_head_kernel_sizes', 'regress_head_num_filters',
+        'regress_head_kernel_sizes'
     ])):
   """Namedtuple to host object detection related parameters.
 
@@ -1630,7 +1776,13 @@ class KeypointEstimationParams(
               keypoint_depth_loss_weight=1.0,
               score_distance_offset=1e-6,
               clip_out_of_frame_keypoints=False,
-              rescore_instances=False):
+              rescore_instances=False,
+              heatmap_head_num_filters=(256),
+              heatmap_head_kernel_sizes=(3),
+              offset_head_num_filters=(256),
+              offset_head_kernel_sizes=(3),
+              regress_head_num_filters=(256),
+              regress_head_kernel_sizes=(3)):
     """Constructor with default values for KeypointEstimationParams.
 
     Args:
@@ -1710,6 +1862,18 @@ class KeypointEstimationParams(
         that are clipped have scores set to 0.0.
       rescore_instances: Whether to rescore instances based on a combination of
         detection score and keypoint scores.
+      heatmap_head_num_filters: filter numbers of the convolutional layers used
+        by the keypoint heatmap prediction head.
+      heatmap_head_kernel_sizes: kernel size of the convolutional layers used
+        by the keypoint heatmap prediction head.
+      offset_head_num_filters: filter numbers of the convolutional layers used
+        by the keypoint offset prediction head.
+      offset_head_kernel_sizes: kernel size of the convolutional layers used
+        by the keypoint offset prediction head.
+      regress_head_num_filters: filter numbers of the convolutional layers used
+        by the keypoint regression prediction head.
+      regress_head_kernel_sizes: kernel size of the convolutional layers used
+        by the keypoint regression prediction head.
 
     Returns:
       An initialized KeypointEstimationParams namedtuple.
@@ -1724,14 +1888,18 @@ class KeypointEstimationParams(
         candidate_search_scale, candidate_ranking_mode, offset_peak_radius,
         per_keypoint_offset, predict_depth, per_keypoint_depth,
         keypoint_depth_loss_weight, score_distance_offset,
-        clip_out_of_frame_keypoints, rescore_instances)
+        clip_out_of_frame_keypoints, rescore_instances,
+        heatmap_head_num_filters, heatmap_head_kernel_sizes,
+        offset_head_num_filters, offset_head_kernel_sizes,
+        regress_head_num_filters, regress_head_kernel_sizes)
 
 
 class ObjectCenterParams(
     collections.namedtuple('ObjectCenterParams', [
         'classification_loss', 'object_center_loss_weight', 'heatmap_bias_init',
         'min_box_overlap_iou', 'max_box_predictions', 'use_labeled_classes',
-        'keypoint_weights_for_center'
+        'keypoint_weights_for_center', 'center_head_num_filters',
+        'center_head_kernel_sizes'
     ])):
   """Namedtuple to store object center prediction related parameters."""
 
@@ -1744,7 +1912,9 @@ class ObjectCenterParams(
               min_box_overlap_iou=0.7,
               max_box_predictions=100,
               use_labeled_classes=False,
-              keypoint_weights_for_center=None):
+              keypoint_weights_for_center=None,
+              center_head_num_filters=(256),
+              center_head_kernel_sizes=(3)):
     """Constructor with default values for ObjectCenterParams.
 
     Args:
@@ -1765,7 +1935,10 @@ class ObjectCenterParams(
         center is calculated by the weighted mean of the keypoint locations. If
         not provided, the object center is determined by the center of the
         bounding box (default behavior).
-
+      center_head_num_filters: filter numbers of the convolutional layers used
+        by the object center prediction head.
+      center_head_kernel_sizes: kernel size of the convolutional layers used
+        by the object center prediction head.
     Returns:
       An initialized ObjectCenterParams namedtuple.
     """
@@ -1773,13 +1946,15 @@ class ObjectCenterParams(
                  cls).__new__(cls, classification_loss,
                               object_center_loss_weight, heatmap_bias_init,
                               min_box_overlap_iou, max_box_predictions,
-                              use_labeled_classes, keypoint_weights_for_center)
+                              use_labeled_classes, keypoint_weights_for_center,
+                              center_head_num_filters, center_head_kernel_sizes)
 
 
 class MaskParams(
     collections.namedtuple('MaskParams', [
         'classification_loss', 'task_loss_weight', 'mask_height', 'mask_width',
-        'score_threshold', 'heatmap_bias_init'
+        'score_threshold', 'heatmap_bias_init', 'mask_head_num_filters',
+        'mask_head_kernel_sizes'
     ])):
   """Namedtuple to store mask prediction related parameters."""
 
@@ -1791,7 +1966,9 @@ class MaskParams(
               mask_height=256,
               mask_width=256,
               score_threshold=0.5,
-              heatmap_bias_init=-2.19):
+              heatmap_bias_init=-2.19,
+              mask_head_num_filters=(256),
+              mask_head_kernel_sizes=(3)):
     """Constructor with default values for MaskParams.
 
     Args:
@@ -1805,6 +1982,10 @@ class MaskParams(
       heatmap_bias_init: float, the initial value of bias in the convolutional
         kernel of the semantic segmentation prediction head. If set to None, the
         bias is initialized with zeros.
+      mask_head_num_filters: filter numbers of the convolutional layers used
+        by the mask prediction head.
+      mask_head_kernel_sizes: kernel size of the convolutional layers used
+        by the mask prediction head.
 
     Returns:
       An initialized MaskParams namedtuple.
@@ -1812,7 +1993,8 @@ class MaskParams(
     return super(MaskParams,
                  cls).__new__(cls, classification_loss,
                               task_loss_weight, mask_height, mask_width,
-                              score_threshold, heatmap_bias_init)
+                              score_threshold, heatmap_bias_init,
+                              mask_head_num_filters, mask_head_kernel_sizes)
 
 
 class DensePoseParams(
@@ -2004,7 +2186,8 @@ class CenterNetMetaArch(model.DetectionModel):
                temporal_offset_params=None,
                use_depthwise=False,
                compute_heatmap_sparse=False,
-               non_max_suppression_fn=None):
+               non_max_suppression_fn=None,
+               unit_height_conv=False):
     """Initializes a CenterNet model.
 
     Args:
@@ -2048,6 +2231,8 @@ class CenterNetMetaArch(model.DetectionModel):
         better with number of channels in the heatmap, but in some cases is
         known to cause an OOM error. See b/170989061.
       non_max_suppression_fn: Optional Non Max Suppression function to apply.
+      unit_height_conv: If True, Conv2Ds in prediction heads have asymmetric
+        kernels with height=1.
     """
     assert object_detection_params or keypoint_params_dict
     # Shorten the name for convenience and better formatting.
@@ -2074,11 +2259,15 @@ class CenterNetMetaArch(model.DetectionModel):
     self._use_depthwise = use_depthwise
     self._compute_heatmap_sparse = compute_heatmap_sparse
 
+    # subclasses may not implement the unit_height_conv arg, so only provide it
+    # as a kwarg if it is True.
+    kwargs = {'unit_height_conv': unit_height_conv} if unit_height_conv else {}
     # Construct the prediction head nets.
     self._prediction_head_dict = self._construct_prediction_heads(
         num_classes,
         self._num_feature_outputs,
-        class_prediction_bias_init=self._center_params.heatmap_bias_init)
+        class_prediction_bias_init=self._center_params.heatmap_bias_init,
+        **kwargs)
     # Initialize the target assigners.
     self._target_assigner_dict = self._initialize_target_assigners(
         stride=self._stride,
@@ -2098,22 +2287,25 @@ class CenterNetMetaArch(model.DetectionModel):
     return self._batched_prediction_tensor_names
 
   def _make_prediction_net_list(self, num_feature_outputs, num_out_channels,
-                                kernel_size=3, num_filters=256, bias_fill=None,
-                                name=None):
+                                kernel_sizes=(3), num_filters=(256),
+                                bias_fill=None, name=None,
+                                unit_height_conv=False):
     prediction_net_list = []
     for i in range(num_feature_outputs):
       prediction_net_list.append(
           make_prediction_net(
               num_out_channels,
-              kernel_size=kernel_size,
+              kernel_sizes=kernel_sizes,
               num_filters=num_filters,
               bias_fill=bias_fill,
               use_depthwise=self._use_depthwise,
-              name='{}_{}'.format(name, i) if name else name))
+              name='{}_{}'.format(name, i) if name else name,
+              unit_height_conv=unit_height_conv))
     return prediction_net_list
 
   def _construct_prediction_heads(self, num_classes, num_feature_outputs,
-                                  class_prediction_bias_init):
+                                  class_prediction_bias_init,
+                                  unit_height_conv=False):
     """Constructs the prediction heads based on the specific parameters.
 
     Args:
@@ -2125,6 +2317,7 @@ class CenterNetMetaArch(model.DetectionModel):
       class_prediction_bias_init: float, the initial value of bias in the
         convolutional kernel of the class prediction head. If set to None, the
         bias is initialized with zeros.
+      unit_height_conv: If True, Conv2Ds have asymmetric kernels with height=1.
 
     Returns:
       A dictionary of keras modules generated by calling make_prediction_net
@@ -2133,14 +2326,29 @@ class CenterNetMetaArch(model.DetectionModel):
     """
     prediction_heads = {}
     prediction_heads[OBJECT_CENTER] = self._make_prediction_net_list(
-        num_feature_outputs, num_classes, bias_fill=class_prediction_bias_init,
-        name='center')
+        num_feature_outputs,
+        num_classes,
+        kernel_sizes=self._center_params.center_head_kernel_sizes,
+        num_filters=self._center_params.center_head_num_filters,
+        bias_fill=class_prediction_bias_init,
+        name='center',
+        unit_height_conv=unit_height_conv)
 
     if self._od_params is not None:
       prediction_heads[BOX_SCALE] = self._make_prediction_net_list(
-          num_feature_outputs, NUM_SIZE_CHANNELS, name='box_scale')
+          num_feature_outputs,
+          NUM_SIZE_CHANNELS,
+          kernel_sizes=self._od_params.scale_head_kernel_sizes,
+          num_filters=self._od_params.scale_head_num_filters,
+          name='box_scale',
+          unit_height_conv=unit_height_conv)
       prediction_heads[BOX_OFFSET] = self._make_prediction_net_list(
-          num_feature_outputs, NUM_OFFSET_CHANNELS, name='box_offset')
+          num_feature_outputs,
+          NUM_OFFSET_CHANNELS,
+          kernel_sizes=self._od_params.offset_head_kernel_sizes,
+          num_filters=self._od_params.offset_head_num_filters,
+          name='box_offset',
+          unit_height_conv=unit_height_conv)
 
     if self._kp_params_dict is not None:
       for task_name, kp_params in self._kp_params_dict.items():
@@ -2149,55 +2357,76 @@ class CenterNetMetaArch(model.DetectionModel):
             task_name, KEYPOINT_HEATMAP)] = self._make_prediction_net_list(
                 num_feature_outputs,
                 num_keypoints,
+                kernel_sizes=kp_params.heatmap_head_kernel_sizes,
+                num_filters=kp_params.heatmap_head_num_filters,
                 bias_fill=kp_params.heatmap_bias_init,
-                name='kpt_heatmap')
+                name='kpt_heatmap',
+                unit_height_conv=unit_height_conv)
         prediction_heads[get_keypoint_name(
             task_name, KEYPOINT_REGRESSION)] = self._make_prediction_net_list(
                 num_feature_outputs,
                 NUM_OFFSET_CHANNELS * num_keypoints,
-                name='kpt_regress')
+                kernel_sizes=kp_params.regress_head_kernel_sizes,
+                num_filters=kp_params.regress_head_num_filters,
+                name='kpt_regress',
+                unit_height_conv=unit_height_conv)
 
         if kp_params.per_keypoint_offset:
           prediction_heads[get_keypoint_name(
               task_name, KEYPOINT_OFFSET)] = self._make_prediction_net_list(
                   num_feature_outputs,
                   NUM_OFFSET_CHANNELS * num_keypoints,
-                  name='kpt_offset')
+                  kernel_sizes=kp_params.offset_head_kernel_sizes,
+                  num_filters=kp_params.offset_head_num_filters,
+                  name='kpt_offset',
+                  unit_height_conv=unit_height_conv)
         else:
           prediction_heads[get_keypoint_name(
               task_name, KEYPOINT_OFFSET)] = self._make_prediction_net_list(
-                  num_feature_outputs, NUM_OFFSET_CHANNELS, name='kpt_offset')
+                  num_feature_outputs,
+                  NUM_OFFSET_CHANNELS,
+                  kernel_sizes=kp_params.offset_head_kernel_sizes,
+                  num_filters=kp_params.offset_head_num_filters,
+                  name='kpt_offset',
+                  unit_height_conv=unit_height_conv)
 
         if kp_params.predict_depth:
           num_depth_channel = (
               num_keypoints if kp_params.per_keypoint_depth else 1)
           prediction_heads[get_keypoint_name(
               task_name, KEYPOINT_DEPTH)] = self._make_prediction_net_list(
-                  num_feature_outputs, num_depth_channel, name='kpt_depth')
+                  num_feature_outputs, num_depth_channel, name='kpt_depth',
+                  unit_height_conv=unit_height_conv)
 
     if self._mask_params is not None:
       prediction_heads[SEGMENTATION_HEATMAP] = self._make_prediction_net_list(
           num_feature_outputs,
           num_classes,
+          kernel_sizes=self._mask_params.mask_head_kernel_sizes,
+          num_filters=self._mask_params.mask_head_num_filters,
           bias_fill=self._mask_params.heatmap_bias_init,
-          name='seg_heatmap')
+          name='seg_heatmap',
+          unit_height_conv=unit_height_conv)
 
     if self._densepose_params is not None:
       prediction_heads[DENSEPOSE_HEATMAP] = self._make_prediction_net_list(
           num_feature_outputs,
           self._densepose_params.num_parts,
           bias_fill=self._densepose_params.heatmap_bias_init,
-          name='dense_pose_heatmap')
+          name='dense_pose_heatmap',
+          unit_height_conv=unit_height_conv)
       prediction_heads[DENSEPOSE_REGRESSION] = self._make_prediction_net_list(
           num_feature_outputs,
           2 * self._densepose_params.num_parts,
-          name='dense_pose_regress')
+          name='dense_pose_regress',
+          unit_height_conv=unit_height_conv)
 
     if self._track_params is not None:
       prediction_heads[TRACK_REID] = self._make_prediction_net_list(
           num_feature_outputs,
           self._track_params.reid_embed_size,
-          name='track_reid')
+          name='track_reid',
+          unit_height_conv=unit_height_conv)
 
       # Creates a classification network to train object embeddings by learning
       # a projection from embedding space to object track ID space.
@@ -2216,7 +2445,8 @@ class CenterNetMetaArch(model.DetectionModel):
                                     self._track_params.reid_embed_size,)))
     if self._temporal_offset_params is not None:
       prediction_heads[TEMPORAL_OFFSET] = self._make_prediction_net_list(
-          num_feature_outputs, NUM_OFFSET_CHANNELS, name='temporal_offset')
+          num_feature_outputs, NUM_OFFSET_CHANNELS, name='temporal_offset',
+          unit_height_conv=unit_height_conv)
     return prediction_heads
 
   def _initialize_target_assigners(self, stride, min_box_overlap_iou):
@@ -2270,7 +2500,8 @@ class CenterNetMetaArch(model.DetectionModel):
                 keypoint_std_dev=kp_params.keypoint_std_dev,
                 peak_radius=kp_params.offset_peak_radius,
                 per_keypoint_offset=kp_params.per_keypoint_offset,
-                compute_heatmap_sparse=self._compute_heatmap_sparse))
+                compute_heatmap_sparse=self._compute_heatmap_sparse,
+                per_keypoint_depth=kp_params.per_keypoint_depth))
     if self._mask_params is not None:
       target_assigners[SEGMENTATION_TASK] = (
           cn_assigner.CenterNetMaskTargetAssigner(stride))
@@ -2524,8 +2755,7 @@ class CenterNetMetaArch(model.DetectionModel):
          gt_weights_list=gt_weights_list,
          gt_classes_list=gt_classes_list,
          gt_boxes_list=gt_boxes_list)
-    flattened_valid_mask = _flatten_spatial_dimensions(
-        tf.expand_dims(valid_mask_batch, axis=-1))
+    flattened_valid_mask = _flatten_spatial_dimensions(valid_mask_batch)
     flattened_heapmap_targets = _flatten_spatial_dimensions(keypoint_heatmap)
     # Sum over the number of instances per keypoint types to get the total
     # number of keypoints. Note that this is used to normalized the loss and we
@@ -2693,16 +2923,13 @@ class CenterNetMetaArch(model.DetectionModel):
          gt_keypoint_depths_list=gt_keypoint_depths_list,
          gt_keypoint_depth_weights_list=gt_keypoint_depth_weights_list)
 
-    if kp_params.per_keypoint_offset and not kp_params.per_keypoint_depth:
-      batch_indices = batch_indices[:, 0:3]
-
     # Keypoint offset loss.
     loss = 0.0
     for prediction in depth_predictions:
+      if kp_params.per_keypoint_depth:
+        prediction = tf.expand_dims(prediction, axis=-1)
       selected_depths = cn_assigner.get_batch_predictions_from_indices(
           prediction, batch_indices)
-      if kp_params.per_keypoint_offset and kp_params.per_keypoint_depth:
-        selected_depths = tf.expand_dims(selected_depths, axis=-1)
       # The dimensions passed are not as per the doc string but the loss
       # still computes the correct value.
       unweighted_loss = localization_loss_fn(
@@ -2751,20 +2978,32 @@ class CenterNetMetaArch(model.DetectionModel):
     Returns:
       A float scalar tensor representing the mask loss.
     """
+    gt_boxes_list = self.groundtruth_lists(fields.BoxListFields.boxes)
     gt_masks_list = self.groundtruth_lists(fields.BoxListFields.masks)
+    gt_mask_weights_list = None
+    if self.groundtruth_has_field(fields.BoxListFields.mask_weights):
+      gt_mask_weights_list = self.groundtruth_lists(
+          fields.BoxListFields.mask_weights)
     gt_classes_list = self.groundtruth_lists(fields.BoxListFields.classes)
 
     # Convert the groundtruth to targets.
     assigner = self._target_assigner_dict[SEGMENTATION_TASK]
-    heatmap_targets = assigner.assign_segmentation_targets(
+    heatmap_targets, heatmap_weight = assigner.assign_segmentation_targets(
         gt_masks_list=gt_masks_list,
-        gt_classes_list=gt_classes_list)
+        gt_classes_list=gt_classes_list,
+        gt_boxes_list=gt_boxes_list,
+        gt_mask_weights_list=gt_mask_weights_list)
 
     flattened_heatmap_targets = _flatten_spatial_dimensions(heatmap_targets)
+    flattened_heatmap_mask = _flatten_spatial_dimensions(
+        heatmap_weight[:, :, :, tf.newaxis])
+    per_pixel_weights *= flattened_heatmap_mask
 
     loss = 0.0
     mask_loss_fn = self._mask_params.classification_loss
-    total_pixels_in_loss = tf.reduce_sum(per_pixel_weights)
+
+    total_pixels_in_loss = tf.math.maximum(
+        tf.reduce_sum(per_pixel_weights), 1)
 
     # Loop through each feature output head.
     for pred in segmentation_predictions:
@@ -3175,8 +3414,8 @@ class CenterNetMetaArch(model.DetectionModel):
     _, input_height, input_width, _ = _get_shape(
         prediction_dict['preprocessed_inputs'], 4)
 
-    output_height, output_width = (input_height // self._stride,
-                                   input_width // self._stride)
+    output_height, output_width = (tf.maximum(input_height // self._stride, 1),
+                                   tf.maximum(input_width // self._stride, 1))
 
     # TODO(vighneshb) Explore whether using floor here is safe.
     output_true_image_shapes = tf.ceil(
@@ -3323,6 +3562,7 @@ class CenterNetMetaArch(model.DetectionModel):
         fields.DetectionResultFields.num_detections: num_detections,
     }
 
+    boxes_strided = None
     if self._od_params:
       boxes_strided = (
           prediction_tensors_to_boxes(y_indices, x_indices,
@@ -3345,8 +3585,8 @@ class CenterNetMetaArch(model.DetectionModel):
       if len(self._kp_params_dict) == 1 and self._num_classes == 1:
         (keypoints, keypoint_scores,
          keypoint_depths) = self._postprocess_keypoints_single_class(
-             prediction_dict, channel_indices, y_indices, x_indices, None,
-             num_detections)
+             prediction_dict, channel_indices, y_indices, x_indices,
+             boxes_strided, num_detections)
         keypoints, keypoint_scores = (
             convert_strided_predictions_to_normalized_keypoints(
                 keypoints, keypoint_scores, self._stride, true_image_shapes,
@@ -3455,10 +3695,10 @@ class CenterNetMetaArch(model.DetectionModel):
       postprocess_dict.update(nmsed_additional_fields)
     return postprocess_dict
 
-  def postprocess_single_instance_keypoints(self, prediction_dict,
-                                            true_image_shapes,
-                                            object_center_std_dev,
-                                            keypoint_std_dev):
+  def postprocess_single_instance_keypoints(
+      self,
+      prediction_dict,
+      true_image_shapes):
     """Postprocess for predicting single instance keypoints.
 
     This postprocess function is a special case of predicting the keypoint of
@@ -3483,17 +3723,6 @@ class CenterNetMetaArch(model.DetectionModel):
       true_image_shapes: int32 tensor of shape [batch, 3] where each row is of
         the form [height, width, channels] indicating the shapes of true images
         in the resized images, as resized images can be padded with zeros.
-      object_center_std_dev: The standard deviation of the Gaussian mask which
-        is applied to the object_heatmap. The goal is to upweight the instance
-        that is closer to the image center. Expressed in units of input image
-        pixels.
-      keypoint_std_dev: The standard deviation of the Gaussian masks which are
-        applied to the keypoint_heatmap based on the regressed joint location.
-        It is used to upweight the keypoint joints that belongs to the targeted
-        instance. If keypoint_std_dev contains one value, then we assume the
-        same value is applied to all keypoint joints. If keypoint_std_dev is a
-        list, it must contain num_keypoints elements, representing the standard
-        deviation corresponding to each joints.
 
     Returns:
       detections: a dictionary containing the following fields
@@ -3524,9 +3753,6 @@ class CenterNetMetaArch(model.DetectionModel):
             keypoint_heatmap=keypoint_heatmap,
             keypoint_offset=keypoint_offset,
             keypoint_regression=keypoint_regression,
-            stride=self._stride,
-            object_center_std_dev=object_center_std_dev,
-            keypoint_std_dev=keypoint_std_dev,
             kp_params=kp_params,
             keypoint_depths=keypoint_depths))
 
@@ -4005,25 +4231,28 @@ class CenterNetMetaArch(model.DetectionModel):
       A dict mapping keys to Trackable objects (tf.Module or Checkpoint).
     """
 
-    supported_types = self._feature_extractor.supported_sub_model_types
-    supported_types += ['fine_tune']
-
-    if fine_tune_checkpoint_type not in supported_types:
-      message = ('Checkpoint type "{}" not supported for {}. '
-                 'Supported types are {}')
-      raise ValueError(
-          message.format(fine_tune_checkpoint_type,
-                         self._feature_extractor.__class__.__name__,
-                         supported_types))
-
-    elif fine_tune_checkpoint_type == 'fine_tune':
+    if fine_tune_checkpoint_type == 'detection':
       feature_extractor_model = tf.train.Checkpoint(
           _feature_extractor=self._feature_extractor)
       return {'model': feature_extractor_model}
 
+    elif fine_tune_checkpoint_type == 'classification':
+      return {
+          'feature_extractor':
+              self._feature_extractor.classification_backbone
+      }
+    elif fine_tune_checkpoint_type == 'full':
+      return {'model': self}
+    elif fine_tune_checkpoint_type == 'fine_tune':
+      raise ValueError(('"fine_tune" is no longer supported for CenterNet. '
+                        'Please set fine_tune_checkpoint_type to "detection"'
+                        ' which has the same functionality. If you are using'
+                        ' the ExtremeNet checkpoint, download the new version'
+                        ' from the model zoo.'))
+
     else:
-      return {'feature_extractor': self._feature_extractor.get_sub_model(
-          fine_tune_checkpoint_type)}
+      raise ValueError('Unknown fine tune checkpoint type {}'.format(
+          fine_tune_checkpoint_type))
 
   def updates(self):
     if tf_version.is_tf2():

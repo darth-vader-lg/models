@@ -76,14 +76,15 @@ def sample_top_p(logits, top_p):
   """
   sorted_indices = tf.argsort(logits, direction="DESCENDING")
   # Flatten logits as tf.gather on TPU needs axis to be compile time constant.
-  range_for_gather = tf.expand_dims(tf.range(0, logits.shape[0]), axis=1)
-  range_for_gather = tf.tile(range_for_gather * logits.shape[1],
-                             [1, logits.shape[1]]) + sorted_indices
+  logits_shape = decoding_module.shape_list(logits)
+  range_for_gather = tf.expand_dims(tf.range(0, logits_shape[0]), axis=1)
+  range_for_gather = tf.tile(range_for_gather * logits_shape[1],
+                             [1, logits_shape[1]]) + sorted_indices
   flattened_logits = tf.reshape(logits, [-1])
   flattened_sorted_indices = tf.reshape(range_for_gather, [-1])
   sorted_logits = tf.reshape(
       tf.gather(flattened_logits, flattened_sorted_indices),
-      [logits.shape[0], logits.shape[1]])
+      [logits_shape[0], logits_shape[1]])
   cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits, axis=-1), axis=-1)
 
   # Remove tokens with cumulative probability above the threshold.
@@ -430,17 +431,17 @@ class SamplingModule(decoding_module.DecodingModule, metaclass=abc.ABCMeta):
 
   def _continue_search(self, state) -> tf.Tensor:
     i = state[decoding_module.StateKeys.CUR_INDEX]
-    return tf.less(i, self.max_decode_length)
+    # Have we reached max decoding length?
+    not_at_end = tf.less(i, self.max_decode_length)
+    # Have all sampled sequences reached an EOS?
+    all_has_eos = tf.reduce_all(
+        state[decoding_module.StateKeys.FINISHED_FLAGS],
+        axis=None,
+        name="search_finish_cond")
+    return tf.logical_and(not_at_end, tf.logical_not(all_has_eos))
 
   def _finished_flags(self, topk_ids, state) -> tf.Tensor:
     new_finished_flags = tf.equal(topk_ids, self.eos_id)
     new_finished_flags = tf.logical_or(
         new_finished_flags, state[decoding_module.StateKeys.FINISHED_FLAGS])
     return new_finished_flags
-
-
-
-
-
-
-
