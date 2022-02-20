@@ -96,3 +96,9 @@ ENV/
 
 # For mac
 .DS_Store
+
+# Protobuf generated files
+research/object_detection/protos/*pb2.py
+
+# Package setup files
+research/setup.py
